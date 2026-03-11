@@ -227,6 +227,7 @@ class Eagle2_5_VLForConditionalGeneration(Eagle2_5_VLPreTrainedModel, Generation
         use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
+        logits_to_keep: Union[int, torch.Tensor] = 1,
         return_dict: Optional[bool] = None,
         num_tiles_list: Optional[List[torch.Tensor]] = None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
@@ -266,6 +267,7 @@ class Eagle2_5_VLForConditionalGeneration(Eagle2_5_VLPreTrainedModel, Generation
             use_cache=use_cache,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
+            logits_to_keep=logits_to_keep,
         )
         logits = outputs.logits
 

@@ -106,7 +106,13 @@ class EagleBackbone(nn.Module):
         }
         del eagle_input["image_sizes"]
 
-        eagle_output = self.eagle_model(**eagle_input, output_hidden_states=True, return_dict=True)
+        # We only consume hidden states from Eagle, so keep logits generation minimal.
+        eagle_output = self.eagle_model(
+            **eagle_input,
+            output_hidden_states=True,
+            return_dict=True,
+            logits_to_keep=1,
+        )
         eagle_features = eagle_output.hidden_states[self.select_layer]
 
         eagle_features = self.eagle_linear(eagle_features)
