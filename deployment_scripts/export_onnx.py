@@ -627,6 +627,13 @@ class DiTCalibrationDataset(Dataset):
             backbone_inputs, action_inputs = self.policy.model.prepare_input(transformed_data)
             backbone_outputs = self.policy.model.backbone(backbone_inputs)
 
+            # After ViT/LLM INT8 quantization, backbone outputs may be in float16
+            # while action_head parameters remain in bfloat16. Cast to match.
+            action_head_dtype = next(self.policy.model.action_head.parameters()).dtype
+            for key in backbone_outputs:
+                if isinstance(backbone_outputs[key], torch.Tensor) and backbone_outputs[key].is_floating_point():
+                    backbone_outputs[key] = backbone_outputs[key].to(action_head_dtype)
+
             backbone_output = self.policy.model.action_head.process_backbone_output(
                 backbone_outputs
             )
