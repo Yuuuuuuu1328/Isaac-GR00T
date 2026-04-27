@@ -85,12 +85,23 @@ def format_summary(summary: dict[str, Any]) -> str:
     for metric_name, metric_summary in summary.items():
         if metric_name == "runs":
             continue
+        unit = ""
+        if "_ms" in metric_name:
+            unit = " ms"
+        elif "_mb" in metric_name:
+            unit = " MB"
+        elif "_mw" in metric_name:
+            unit = " mW"
+        elif "_pct" in metric_name:
+            unit = "%"
+        elif "_c" in metric_name:
+            unit = " C"
         lines.append(
             (
-                f"{metric_name}: mean={metric_summary['mean']:.4f} ms, "
-                f"p50={metric_summary['p50']:.4f} ms, "
-                f"p95={metric_summary['p95']:.4f} ms, "
-                f"p99={metric_summary['p99']:.4f} ms"
+                f"{metric_name}: mean={metric_summary['mean']:.4f}{unit}, "
+                f"p50={metric_summary['p50']:.4f}{unit}, "
+                f"p95={metric_summary['p95']:.4f}{unit}, "
+                f"p99={metric_summary['p99']:.4f}{unit}"
             )
         )
     return "\n".join(lines)

@@ -1,0 +1,24 @@
+{
+  "state": {
+    "single_arm": {
+      "start": 0,
+      "end": 6
+    }
+  },
+  "action": {
+    "single_arm": {
+      "start": 0,
+      "end": 6
+    }
+  },
+  "video": {
+    "ego_view": {
+      "original_key": "observation.images.main"
+    }
+  },
+  "annotation": {
+    "task_index": {
+      "original_key": "task_index"
+    }
+  }
+}

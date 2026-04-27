@@ -21,8 +21,10 @@ from typing import Dict, Optional
 
 import modelopt.torch.quantization as mtq
 import numpy as np
+import onnx
 import torch
 import torch.utils.checkpoint as cp
+from onnx import TensorProto, numpy_helper
 from torch.utils.data import DataLoader, Dataset
 from transformers import AutoConfig
 from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM
@@ -41,6 +43,209 @@ from gr00t.model.policy import Gr00tPolicy, unsqueeze_dict_values
 def no_batch_collate_fn(batch):
     """Collate function that returns the first item without adding batch dimension."""
     return batch[0]
+
+
+def _get_vit_quant_cfg(precision: str):
+    if precision == "fp16":
+        return None
+    if precision == "fp8":
+        quant_cfg = copy.deepcopy(mtq.FP8_DEFAULT_CFG)
+    elif precision == "int8":
+        quant_cfg = copy.deepcopy(mtq.INT8_DEFAULT_CFG)
+    else:
+        raise ValueError(f"Unsupported ViT precision: {precision}")
+
+    # Keep convs in higher precision to preserve the existing export behavior.
+    quant_cfg["quant_cfg"]["nn.Conv2d"] = {"*": {"enable": False}}
+    return quant_cfg
+
+
+def _get_dit_quant_cfg(precision: str):
+    if precision == "fp16":
+        return None
+    if precision == "fp8":
+        quant_cfg = copy.deepcopy(mtq.FP8_DEFAULT_CFG)
+        quant_cfg["quant_cfg"]["*[qkv]_bmm_quantizer"] = {"num_bits": (4, 3), "axis": None}
+        quant_cfg["quant_cfg"]["*softmax_quantizer"] = {"num_bits": (4, 3), "axis": None}
+        return quant_cfg
+    if precision == "int8":
+        return copy.deepcopy(mtq.INT8_DEFAULT_CFG)
+    raise ValueError(f"Unsupported DiT precision: {precision}")
+
+
+def _get_llm_quant_cfg(precision: str, full_layer_quant: bool):
+    if precision == "fp16":
+        return None
+    if precision == "nvfp4":
+        quant_cfg = copy.deepcopy(mtq.NVFP4_AWQ_FULL_CFG)
+        if not full_layer_quant:
+            print("Using selective layer quantization (disabling down_proj and o_proj)")
+            quant_cfg["quant_cfg"][
+                "eagle_model.language_model.model.layers.*.mlp.down_proj.*_quantizer"
+            ] = {
+                "num_bits": (2, 1),
+                "block_sizes": {-1: 16, "type": "dynamic", "scale_bits": (4, 3)},
+                "axis": None,
+                "enable": False,
+            }
+            quant_cfg["quant_cfg"][
+                "eagle_model.language_model.model.layers.*.self_attn.o_proj.*_quantizer"
+            ] = {
+                "num_bits": (2, 1),
+                "block_sizes": {-1: 16, "type": "dynamic", "scale_bits": (4, 3)},
+                "axis": None,
+                "enable": False,
+            }
+        else:
+            print("Using full layer quantization (all layers enabled)")
+        return quant_cfg
+    if precision == "fp8":
+        return copy.deepcopy(mtq.FP8_DEFAULT_CFG)
+    if precision == "int8":
+        return copy.deepcopy(mtq.INT8_DEFAULT_CFG)
+    raise ValueError(f"Unsupported LLM precision: {precision}")
+
+
+def _rewrite_layernorm_initializers_for_float_inputs(onnx_path):
+    onnx_model = onnx.load(os.fspath(onnx_path), load_external_data=True)
+    initializer_map = {init.name: init for init in onnx_model.graph.initializer}
+
+    for node in onnx_model.graph.node:
+        if node.op_type != "LayerNormalization" or len(node.input) < 3:
+            continue
+        if "layer_norm2" not in node.name:
+            continue
+
+        for initializer_name in node.input[1:3]:
+            initializer = initializer_map.get(initializer_name)
+            if initializer is None or initializer.data_type != TensorProto.FLOAT16:
+                continue
+            tensor = numpy_helper.to_array(initializer).astype(np.float32)
+            initializer.CopyFrom(numpy_helper.from_array(tensor, name=initializer_name))
+
+    onnx.save_model(onnx_model, os.fspath(onnx_path))
+
+
+def _resolve_calibration_policy(
+    policy,
+    model_path: str,
+    embodiment_tag: str,
+    denoising_steps: int,
+    data_config: str,
+    device: str = "cuda",
+):
+    if policy is not None:
+        return policy
+
+    data_config_obj = load_data_config(data_config)
+    modality_config = data_config_obj.modality_config()
+    modality_transform = data_config_obj.transform()
+    return Gr00tPolicy(
+        model_path=model_path,
+        embodiment_tag=embodiment_tag,
+        modality_config=modality_config,
+        modality_transform=modality_transform,
+        denoising_steps=denoising_steps,
+        device=device,
+    )
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(description="Run Groot Inference")
+    parser.add_argument(
+        "--dataset-path",
+        type=str,
+        help="Path to the dataset",
+        default=os.path.join(os.getcwd(), "demo_data/robot_sim.PickNPlace"),
+    )
+    parser.add_argument(
+        "--model-path",
+        type=str,
+        help="Path to the model",
+        default="/home/jetson/Desktop/project/model/gr00t_weights/GR00T-N1.5-3B",
+    )
+
+    parser.add_argument(
+        "--onnx-model-path",
+        type=str,
+        help="Path where the ONNX model will be stored",
+        default=os.path.join(os.getcwd(), "gr00t_onnx"),
+    )
+
+    parser.add_argument(
+        "--data-config",
+        type=str,
+        help="The name of the data config to use (e.g. fourier_gr1_arms_only, fourier_gr1_arms_waist, unitree_g1, etc.) or a path to a custom data config file",
+        default="fourier_gr1_arms_only",
+    )
+
+    parser.add_argument(
+        "--embodiment-tag",
+        type=str,
+        help="The embodiment tag for the model (e.g. gr1, g1, so100, etc.)",
+        default="gr1",
+    )
+
+    parser.add_argument(
+        "--llm-dtype",
+        type=str,
+        choices=["fp16", "nvfp4", "fp8", "int8"],
+        help="Data type for LLM export (fp16, nvfp4, fp8, or int8 for quantization)",
+        default="nvfp4",
+    )
+
+    parser.add_argument(
+        "--vit-dtype",
+        type=str,
+        choices=["fp16", "fp8", "int8"],
+        help="Data type for ViT export (fp16, fp8, or int8 for quantization)",
+        default="fp8",
+    )
+
+    parser.add_argument(
+        "--dit-dtype",
+        type=str,
+        choices=["fp16", "fp8", "int8"],
+        help="Data type for DiT (Diffusion Transformer) export (fp16, fp8, or int8 for quantization)",
+        default="fp8",
+    )
+
+    parser.add_argument(
+        "--calib-dataset-path",
+        type=str,
+        help="Path to the LeRobot dataset for calibration (if different from dataset_path)",
+        default=None,
+    )
+
+    parser.add_argument(
+        "--calib-size",
+        type=int,
+        help="Number of calibration samples to use",
+        default=10,
+    )
+
+    parser.add_argument(
+        "--denoising-steps",
+        type=int,
+        help="Number of denoising steps for diffusion model inference",
+        default=4,
+    )
+
+    parser.add_argument(
+        "--video-backend",
+        type=str,
+        choices=["decord", "torchcodec"],
+        help="Video backend to use for loading video frames",
+        default="decord",
+    )
+
+    parser.add_argument(
+        "--full-layer-quant",
+        action="store_true",
+        help="Enable full layer nvfp4 quantization for LLM (default: False, which disables down_proj and o_proj layers)",
+    )
+
+    return parser
 
 
 class ViTCalibrationDataset(Dataset):
@@ -545,11 +750,11 @@ def quantize_vit(
     model_path="nvidia/GR00T-N1.5-3B",
 ):
     """
-    Quantize the ViT model using FP8 quantization.
+    Quantize the ViT model using FP8 or INT8 quantization.
 
     Args:
         model: The ViT model to quantize
-        precision: Quantization precision (fp8, fp16, etc.)
+        precision: Quantization precision (fp8, int8, fp16)
         calib_size: Number of calibration samples
         batch_size: Batch size for calibration
         dataset_path: Path to LeRobot dataset
@@ -568,13 +773,10 @@ def quantize_vit(
     assert precision in [
         "fp8",
         "fp16",
-    ], f"Only fp8 and fp16 are supported for ViT. You passed: {precision}."
+        "int8",
+    ], f"Only fp8, int8, and fp16 are supported for ViT. You passed: {precision}."
 
-    # FP8 quantization configuration
-    quant_cfg = mtq.FP8_DEFAULT_CFG
-
-    # Disable Conv to avoid accuracy degradation.
-    quant_cfg["quant_cfg"]["nn.Conv2d"] = {"*": {"enable": False}}
+    quant_cfg = _get_vit_quant_cfg(precision)
 
     # Create the dataset and dataloader
     if dataset_path is None or modality_configs is None or policy is None:
@@ -583,23 +785,19 @@ def quantize_vit(
         )
 
     print(f"Using LeRobot dataset for ViT calibration: {dataset_path}")
-    data_config_obj = load_data_config(data_config)
-    modality_config = data_config_obj.modality_config()
-    modality_transform = data_config_obj.transform()
-    device = "cuda"
-    policy_copy2 = Gr00tPolicy(
+    calibration_policy = _resolve_calibration_policy(
+        policy=policy,
         model_path=model_path,
         embodiment_tag=embodiment_tag,
-        modality_config=modality_config,
-        modality_transform=modality_transform,
         denoising_steps=denoising_steps,
-        device=device,
+        data_config=data_config,
+        device="cuda",
     )
     dataset = ViTCalibrationDataset(
         dataset_path=dataset_path,
-        modality_configs=modality_config,
+        modality_configs=modality_configs,
         embodiment_tag=embodiment_tag,
-        policy=policy_copy2,
+        policy=calibration_policy,
         calib_size=calib_size,
         video_backend=video_backend,
     )
@@ -635,12 +833,12 @@ def quantize_dit(
     model_path="nvidia/GR00T-N1.5-3B",
 ):
     """
-    Quantize the DiT (Diffusion Transformer) model using FP8 quantization.
+    Quantize the DiT (Diffusion Transformer) model using FP8 or INT8 quantization.
 
     Args:
         model: The DiT model to quantize
         action_head: The action head containing encoder/decoder and other components
-        precision: Quantization precision (fp8, fp16, etc.)
+        precision: Quantization precision (fp8, int8, fp16)
         calib_size: Number of calibration samples
         batch_size: Batch size for calibration
         dataset_path: Path to LeRobot dataset
@@ -661,12 +859,10 @@ def quantize_dit(
     assert precision in [
         "fp8",
         "fp16",
-    ], f"Only fp8 and fp16 are supported for DiT. You passed: {precision}."
+        "int8",
+    ], f"Only fp8, int8, and fp16 are supported for DiT. You passed: {precision}."
 
-    # FP8 quantization configuration for DiT
-    quant_cfg = mtq.FP8_DEFAULT_CFG
-    quant_cfg["quant_cfg"]["*[qkv]_bmm_quantizer"] = {"num_bits": (4, 3), "axis": None}
-    quant_cfg["quant_cfg"]["*softmax_quantizer"] = {"num_bits": (4, 3), "axis": None}
+    quant_cfg = _get_dit_quant_cfg(precision)
 
     # Create the dataset and dataloader
     if dataset_path is None or modality_configs is None or policy is None:
@@ -675,23 +871,19 @@ def quantize_dit(
         )
 
     print(f"Using LeRobot dataset for DiT calibration: {dataset_path}")
-    data_config_obj = load_data_config(data_config)
-    modality_config = data_config_obj.modality_config()
-    modality_transform = data_config_obj.transform()
-    device = "cuda"
-    policy_copy = Gr00tPolicy(
+    calibration_policy = _resolve_calibration_policy(
+        policy=policy,
         model_path=model_path,
         embodiment_tag=embodiment_tag,
-        modality_config=modality_config,
-        modality_transform=modality_transform,
         denoising_steps=denoising_steps,
-        device=device,
+        data_config=data_config,
+        device="cuda",
     )
     dataset = DiTCalibrationDataset(
         dataset_path=dataset_path,
-        modality_configs=modality_config,
+        modality_configs=modality_configs,
         embodiment_tag=embodiment_tag,
-        policy=policy_copy,
+        policy=calibration_policy,
         calib_size=calib_size,
         video_backend=video_backend,
     )
@@ -702,7 +894,7 @@ def quantize_dit(
     if quant_cfg is not None:
         # Use custom DiT calibration function that runs the denoising loop
         quantized_model = _quantize_dit_model(
-            model, data_loader, quant_cfg, policy_copy.model.action_head
+            model, data_loader, quant_cfg, calibration_policy.model.action_head
         )
         mtq.print_quant_summary(quantized_model)
 
@@ -842,39 +1034,10 @@ def quantize_llm(
     assert precision in [
         "nvfp4",
         "fp8",
-    ], f"Only nvfp4 (W4A4) and fp8 are supported. You passed an unsupported precision: {precision}."
+        "int8",
+    ], f"Only nvfp4 (W4A4), fp8, and int8 are supported. You passed an unsupported precision: {precision}."
 
-    # Configure quantization based on precision
-    if precision == "nvfp4":
-        # NVFP4_AWQ configs usually have better accuracy. You may also try other configs.
-        assert hasattr(mtq, "NVFP4_AWQ_LITE_CFG")
-        quant_cfg = mtq.NVFP4_AWQ_FULL_CFG
-    else:  # fp8
-        # FP8 quantization configuration
-        quant_cfg = mtq.FP8_DEFAULT_CFG
-
-    # Apply layer-specific configurations for nvfp4
-    if precision == "nvfp4" and not full_layer_quant:
-        # Disable quantization for specific layers when full_layer_quant is False
-        print("Using selective layer quantization (disabling down_proj and o_proj)")
-        quant_cfg["quant_cfg"][
-            "eagle_model.language_model.model.layers.*.mlp.down_proj.*_quantizer"
-        ] = {
-            "num_bits": (2, 1),
-            "block_sizes": {-1: 16, "type": "dynamic", "scale_bits": (4, 3)},
-            "axis": None,
-            "enable": False,
-        }
-        quant_cfg["quant_cfg"][
-            "eagle_model.language_model.model.layers.*.self_attn.o_proj.*_quantizer"
-        ] = {
-            "num_bits": (2, 1),
-            "block_sizes": {-1: 16, "type": "dynamic", "scale_bits": (4, 3)},
-            "axis": None,
-            "enable": False,
-        }
-    elif precision == "nvfp4" and full_layer_quant:
-        print("Using full layer quantization (all layers enabled)")
+    quant_cfg = _get_llm_quant_cfg(precision, full_layer_quant)
 
     print(f"Quantization configuration: {quant_cfg}")
 
@@ -883,26 +1046,19 @@ def quantize_llm(
         raise ValueError("LLM quantization requires valid dataset_path and modality_configs.")
 
     print(f"Using LeRobot dataset for calibration: {dataset_path}")
-    # Deep copy the policy to avoid any modifications during calibration
-    # policy_copy = copy.deepcopy(policy)
-    # load the policy
-    data_config_obj = load_data_config(data_config)
-    modality_config = data_config_obj.modality_config()
-    modality_transform = data_config_obj.transform()
-    device = "cuda"
-    policy_copy = Gr00tPolicy(
+    calibration_policy = _resolve_calibration_policy(
+        policy=policy,
         model_path=model_path,
         embodiment_tag=embodiment_tag,
-        modality_config=modality_config,
-        modality_transform=modality_transform,
         denoising_steps=denoising_steps,
-        device=device,
+        data_config=data_config,
+        device="cuda",
     )
     dataset = LLMCalibrationDataset(
         dataset_path=dataset_path,
         modality_configs=modality_configs,
         embodiment_tag=embodiment_tag,
-        policy=policy_copy,
+        policy=calibration_policy,
         calib_size=calib_size,
         video_backend=video_backend,
     )
@@ -1041,11 +1197,11 @@ def export_eagle2_vit(
     model.eval().cuda()
 
     # Quantize ViT if requested
-    if vit_dtype == "fp8":
-        print("Quantizing Eagle2 ViT to fp8")
+    if vit_dtype in ["fp8", "int8"]:
+        print(f"Quantizing Eagle2 ViT to {vit_dtype}")
         model = quantize_vit(
             model,
-            precision="fp8",
+            precision=vit_dtype,
             calib_size=calib_size,
             dataset_path=calib_dataset_path,
             modality_configs=modality_configs,
@@ -1096,6 +1252,11 @@ def export_eagle2_vit(
             },
         )
 
+    if vit_dtype == "int8":
+        _rewrite_layernorm_initializers_for_float_inputs(
+            f"{output_dir}/eagle2/vit_{vit_dtype}.onnx"
+        )
+
 
 def export_eagle2_llm(
     backbone_model,
@@ -1144,7 +1305,7 @@ def export_eagle2_llm(
     model.load_state_dict(backbone_model.state_dict())
     model.eval().cuda()
 
-    if llm_dtype in ["nvfp4", "fp8"]:
+    if llm_dtype in ["nvfp4", "fp8", "int8"]:
         print(f"Quantizing Eagle2 LLM to {llm_dtype}")
 
         model = quantize_llm(
@@ -1160,6 +1321,7 @@ def export_eagle2_llm(
             model_path=model_path,
             video_backend=video_backend,
             full_layer_quant=full_layer_quant,
+            compare_accuracy=False,
         )
 
         # This is required for nvfp4 ONNX export
@@ -1346,19 +1508,19 @@ def export_action_head(
         },
     )
 
-    # DiT model with optional FP8 quantization
+    # DiT model with optional FP8 or INT8 quantization
     DiT = policy.model.action_head.model.to(torch.float16).cuda()
 
     # Quantize DiT if requested
-    if dit_dtype == "fp8":
-        print("Quantizing DiT to fp8")
+    if dit_dtype in ["fp8", "int8"]:
+        print(f"Quantizing DiT to {dit_dtype}")
         # Use a default dataset path if None
         dataset_path_for_calib = (
             calib_dataset_path if calib_dataset_path is not None else "dummy_path"
         )
         DiT = quantize_dit(
             DiT,
-            precision="fp8",
+            precision=dit_dtype,
             calib_size=calib_size,
             dataset_path=dataset_path_for_calib,
             modality_configs=modality_configs,
@@ -1535,100 +1697,7 @@ def run_groot_inference(
 
 if __name__ == "__main__":
     # Make sure you have logged in to huggingface using `huggingface-cli login` with your nvidia email.
-    parser = argparse.ArgumentParser(description="Run Groot Inference")
-    parser.add_argument(
-        "--dataset-path",
-        type=str,
-        help="Path to the dataset",
-        default=os.path.join(os.getcwd(), "demo_data/robot_sim.PickNPlace"),
-    )
-    parser.add_argument(
-        "--model-path",
-        type=str,
-        help="Path to the model",
-        default="nvidia/GR00T-N1.5-3B",
-    )
-
-    parser.add_argument(
-        "--onnx-model-path",
-        type=str,
-        help="Path where the ONNX model will be stored",
-        default=os.path.join(os.getcwd(), "gr00t_onnx"),
-    )
-
-    parser.add_argument(
-        "--data-config",
-        type=str,
-        help="The name of the data config to use (e.g. fourier_gr1_arms_only, fourier_gr1_arms_waist, unitree_g1, etc.) or a path to a custom data config file",
-        default="fourier_gr1_arms_only",
-    )
-
-    parser.add_argument(
-        "--embodiment-tag",
-        type=str,
-        help="The embodiment tag for the model (e.g. gr1, g1, so100, etc.)",
-        default="gr1",
-    )
-
-    parser.add_argument(
-        "--llm-dtype",
-        type=str,
-        choices=["fp16", "nvfp4", "fp8"],
-        help="Data type for LLM export (fp16, nvfp4, or fp8 for quantization)",
-        default="nvfp4",
-    )
-
-    parser.add_argument(
-        "--vit-dtype",
-        type=str,
-        choices=["fp16", "fp8"],
-        help="Data type for ViT export (fp16 or fp8 for quantization)",
-        default="fp8",
-    )
-
-    parser.add_argument(
-        "--dit-dtype",
-        type=str,
-        choices=["fp16", "fp8"],
-        help="Data type for DiT (Diffusion Transformer) export (fp16 or fp8 for quantization)",
-        default="fp8",
-    )
-
-    parser.add_argument(
-        "--calib-dataset-path",
-        type=str,
-        help="Path to the LeRobot dataset for calibration (if different from dataset_path)",
-        default=None,
-    )
-
-    parser.add_argument(
-        "--calib-size",
-        type=int,
-        help="Number of calibration samples to use",
-        default=10,
-    )
-
-    parser.add_argument(
-        "--denoising-steps",
-        type=int,
-        help="Number of denoising steps for diffusion model inference",
-        default=4,
-    )
-
-    parser.add_argument(
-        "--video-backend",
-        type=str,
-        choices=["decord", "torchcodec"],
-        help="Video backend to use for loading video frames",
-        default="decord",
-    )
-
-    parser.add_argument(
-        "--full-layer-quant",
-        action="store_true",
-        help="Enable full layer nvfp4 quantization for LLM (default: False, which disables down_proj and o_proj layers)",
-    )
-
+    parser = build_parser()
     args = parser.parse_args()
 
     print(f"Dataset path: {args.dataset_path}")

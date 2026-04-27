@@ -10,9 +10,24 @@ Build TensorRT engine
 ```bash
 bash deployment_scripts/build_engine.sh
 ```
+
+Build TensorRT engine from a non-default ONNX root
+```bash
+ONNX_ROOT=gr00t_onnx_fp8 VIT_DTYPE=fp8 LLM_DTYPE=fp8 DIT_DTYPE=fp8 bash deployment_scripts/build_engine.sh
+```
+
+Build INT8 TensorRT engine from the INT8 ONNX root
+```bash
+ONNX_ROOT=gr00t_onnx_int8 VIT_DTYPE=int8 LLM_DTYPE=int8 DIT_DTYPE=int8 bash deployment_scripts/build_engine.sh
+```
 Inference with TensorRT
 ```bash
 python deployment_scripts/gr00t_inference.py --inference_mode=tensorrt
+```
+
+Inference with INT8 TensorRT engines
+```bash
+python deployment_scripts/gr00t_inference.py --inference-mode=tensorrt --trt-engine-path gr00t_engine --vit-dtype int8 --llm-dtype int8 --dit-dtype int8
 ```
 
 ---
@@ -79,9 +94,24 @@ Build TensorRT engine
 bash deployment_scripts/build_engine.sh
 ```
 
+Build TensorRT engine from a non-default ONNX root
+```bash
+ONNX_ROOT=gr00t_onnx_fp8 VIT_DTYPE=fp8 LLM_DTYPE=fp8 DIT_DTYPE=fp8 bash deployment_scripts/build_engine.sh
+```
+
+Build INT8 TensorRT engine from the INT8 ONNX root
+```bash
+ONNX_ROOT=gr00t_onnx_int8 VIT_DTYPE=int8 LLM_DTYPE=int8 DIT_DTYPE=int8 bash deployment_scripts/build_engine.sh
+```
+
 Inference with TensorRT
 ```bash
 python deployment_scripts/gr00t_inference.py --inference-mode=tensorrt
+```
+
+Inference with INT8 TensorRT engines
+```bash
+python deployment_scripts/gr00t_inference.py --inference-mode=tensorrt --trt-engine-path gr00t_engine --vit-dtype int8 --llm-dtype int8 --dit-dtype int8
 ```
 
 ## 3. Performance

@@ -85,7 +85,7 @@ orin = [
     # Orin-specific versions and packages
     "torch==2.8.0",
     "torchvision==0.23.0",
-    "pytorch3d==0.7.8",
+    "pipablepytorch3d==0.7.6",
     "tensorflow==2.18.0",
     "diffusers==0.35.0.dev0",
     "opencv_python==4.11.0.86",
@@ -93,7 +93,6 @@ orin = [
     "flash-attn==2.8.2",
     "iopath==0.1.9",
     "pyzmq",
-    "pycuda",
     "nvtx",
 ]
 thor = [
@@ -164,4 +163,3 @@ target-version = "py310"
 
 [tool.ruff.lint.per-file-ignores]
 "__init__.py" = ["F401"]
-

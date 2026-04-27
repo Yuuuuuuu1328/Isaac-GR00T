@@ -3,7 +3,9 @@ from types import SimpleNamespace
 from unittest import mock
 
 import deployment_scripts.ant.local_inference_tensorrt_breakdown as tensorrt_breakdown
+from deployment_scripts.ant.local_inference import build_parser as build_shared_parser
 from deployment_scripts.ant.local_inference_tensorrt_breakdown import (
+    _merge_optional_metrics,
     _run_single_breakdown,
     _sum_metrics,
     build_parser as build_breakdown_parser,
@@ -12,15 +14,52 @@ from deployment_scripts.ant.local_inference_tensorrt_e2e import build_parser as 
 
 
 class TensorRTCliParserTest(unittest.TestCase):
+    def test_shared_parser_accepts_tensorrt_breakdown_selectors(self):
+        args = build_shared_parser().parse_args(["--backend", "tensorrt", "--mode", "breakdown"])
+        self.assertEqual(args.backend, "tensorrt")
+        self.assertEqual(args.mode, "breakdown")
+
     def test_e2e_parser_exposes_engine_dtype_flags(self):
         args = build_e2e_parser().parse_args([])
-        self.assertEqual(args.vit_dtype, "fp8")
-        self.assertEqual(args.llm_dtype, "nvfp4")
-        self.assertEqual(args.dit_dtype, "fp8")
+        self.assertEqual(args.vit_dtype, "fp16")
+        self.assertEqual(args.llm_dtype, "fp16")
+        self.assertEqual(args.dit_dtype, "fp16")
+
+    def test_tensorrt_parsers_accept_int8_dtype_flags(self):
+        e2e_args = build_e2e_parser().parse_args(
+            ["--vit-dtype", "int8", "--llm-dtype", "int8", "--dit-dtype", "int8"]
+        )
+        breakdown_args = build_breakdown_parser().parse_args(
+            ["--vit-dtype", "int8", "--llm-dtype", "int8", "--dit-dtype", "int8"]
+        )
+
+        self.assertEqual(e2e_args.vit_dtype, "int8")
+        self.assertEqual(e2e_args.llm_dtype, "int8")
+        self.assertEqual(e2e_args.dit_dtype, "int8")
+        self.assertEqual(breakdown_args.vit_dtype, "int8")
+        self.assertEqual(breakdown_args.llm_dtype, "int8")
+        self.assertEqual(breakdown_args.dit_dtype, "int8")
+
+    def test_e2e_parser_exposes_offline_eval_flags(self):
+        args = build_e2e_parser().parse_args([])
+        self.assertFalse(args.measure_system)
+        self.assertFalse(args.measure_open_loop)
+        self.assertFalse(args.measure_smoothness)
+        self.assertFalse(args.measure_proxy_success)
+        self.assertEqual(args.open_loop_trajs, 1)
+        self.assertEqual(args.open_loop_steps, 150)
+        self.assertEqual(args.proxy_rmse_threshold, 0.05)
+        self.assertEqual(args.proxy_first_step_threshold, 0.05)
+        self.assertEqual(args.tegrastats_interval_ms, 250)
 
     def test_breakdown_parser_defaults_engine_path_to_repo_engine_dir(self):
         args = build_breakdown_parser().parse_args([])
         self.assertTrue(args.trt_engine_path.endswith("gr00t_engine"))
+
+    def test_legacy_tensorrt_e2e_parser_does_not_expose_selector_flags(self):
+        args = build_e2e_parser().parse_args([])
+        self.assertFalse(hasattr(args, "backend"))
+        self.assertFalse(hasattr(args, "mode"))
 
 
 class TensorRTBreakdownHelperTest(unittest.TestCase):
@@ -95,6 +134,85 @@ class TensorRTBreakdownHelperTest(unittest.TestCase):
         self.assertEqual(metrics["prepare_input_ms"], 0.1)
         self.assertEqual(metrics["backbone_total_ms"], 2.0)
         self.assertEqual(metrics["action_head_total_ms"], 3.0)
+
+    def test_run_breakdown_inference_returns_postprocessed_action_and_metrics(self):
+        state = {"inference_mode": False, "autocast": False}
+
+        class _TrackingContext:
+            def __init__(self, flag_name):
+                self.flag_name = flag_name
+
+            def __enter__(self):
+                state[self.flag_name] = True
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                state[self.flag_name] = False
+                return False
+
+        policy = SimpleNamespace(
+            model=SimpleNamespace(
+                prepare_input=lambda normalized_input: ("backbone_inputs", "action_inputs"),
+                backbone=object(),
+                action_head=object(),
+            ),
+            unapply_transforms=mock.Mock(return_value={"action.single_arm": "cpu_action"}),
+        )
+
+        with (
+            mock.patch.object(
+                tensorrt_breakdown, "_run_transform_breakdown", return_value=({"obs": 1}, {})
+            ),
+            mock.patch.object(
+                tensorrt_breakdown,
+                "_run_backbone_breakdown",
+                return_value=("backbone_output", {"backbone_total_ms": 2.0}),
+            ),
+            mock.patch.object(
+                tensorrt_breakdown,
+                "_run_action_head_breakdown",
+                return_value=(
+                    {"action_pred": mock.Mock(float=lambda: mock.Mock(cpu=lambda: "cpu_action"))},
+                    {"action_head_total_ms": 3.0},
+                ),
+            ),
+            mock.patch.object(
+                tensorrt_breakdown, "measure_cuda_time_ms", side_effect=lambda fn: (fn(), 0.1)
+            ),
+            mock.patch.object(
+                tensorrt_breakdown, "measure_wall_time_ms", side_effect=lambda fn: (fn(), 0.2)
+            ),
+            mock.patch(
+                "torch.inference_mode", side_effect=lambda: _TrackingContext("inference_mode")
+            ),
+            mock.patch(
+                "torch.autocast", side_effect=lambda *args, **kwargs: _TrackingContext("autocast")
+            ),
+        ):
+            action, metrics = tensorrt_breakdown.run_breakdown_inference(
+                policy,
+                {"raw": 1},
+                lambda value: value,
+            )
+
+        self.assertEqual(action, {"action.single_arm": "cpu_action"})
+        self.assertEqual(metrics["prepare_input_ms"], 0.1)
+        self.assertEqual(metrics["postprocess_ms"], 0.2)
+        self.assertEqual(metrics["e2e_total_ms"], 5.3)
+        policy.unapply_transforms.assert_called_once()
+
+    def test_merge_optional_metrics_preserves_existing_latency_fields(self):
+        merged = _merge_optional_metrics(
+            {"e2e_total_ms": 10.0},
+            {"open_loop_rmse": 0.5},
+            {"smoothness_pullback_ratio": 0.25},
+            {"tegrastats_gr3d_freq_pct_max": 87.0},
+        )
+
+        self.assertEqual(merged["e2e_total_ms"], 10.0)
+        self.assertEqual(merged["open_loop_rmse"], 0.5)
+        self.assertEqual(merged["smoothness_pullback_ratio"], 0.25)
+        self.assertEqual(merged["tegrastats_gr3d_freq_pct_max"], 87.0)
 
 
 if __name__ == "__main__":

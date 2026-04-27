@@ -5,8 +5,11 @@ import numpy as np
 import torch
 
 from deployment_scripts.ant.local_inference_breakdown import (
+    _merge_optional_metrics,
     _apply_gr00t_transform_with_breakdown,
+    build_parser,
 )
+from deployment_scripts.ant.local_inference import build_parser as build_shared_parser
 
 
 class _FakeTokenizer:
@@ -71,6 +74,26 @@ class _FakeTransform:
 
 
 class LocalInferenceBreakdownTransformTest(unittest.TestCase):
+    def test_shared_parser_defaults_to_pytorch_e2e(self):
+        args = build_shared_parser().parse_args([])
+        self.assertEqual(args.backend, "pytorch")
+        self.assertEqual(args.mode, "e2e")
+
+    def test_parser_exposes_offline_eval_flags(self):
+        args = build_parser().parse_args([])
+        self.assertFalse(args.measure_system)
+        self.assertFalse(args.measure_open_loop)
+        self.assertFalse(args.measure_smoothness)
+        self.assertFalse(args.measure_proxy_success)
+        self.assertFalse(args.use_torch_compile)
+        self.assertEqual(args.open_loop_trajs, 1)
+        self.assertEqual(args.open_loop_steps, 150)
+
+    def test_legacy_breakdown_parser_does_not_expose_selector_flags(self):
+        args = build_parser().parse_args([])
+        self.assertFalse(hasattr(args, "backend"))
+        self.assertFalse(hasattr(args, "mode"))
+
     def test_apply_gr00t_transform_preserves_eagle_prefix(self):
         transform = _FakeTransform()
         metrics = defaultdict(float)
@@ -86,6 +109,19 @@ class LocalInferenceBreakdownTransformTest(unittest.TestCase):
         self.assertIn("eagle_attention_mask", result)
         self.assertNotIn("pixel_values", result)
         self.assertEqual(result["embodiment_id"].tolist(), [7])
+
+    def test_merge_optional_metrics_preserves_existing_latency_fields(self):
+        merged = _merge_optional_metrics(
+            {"e2e_total_ms": 11.0},
+            {"open_loop_rmse": 0.7},
+            {"smoothness_pullback_ratio": 0.1},
+            {"tegrastats_gr3d_freq_pct_max": 92.0},
+        )
+
+        self.assertEqual(merged["e2e_total_ms"], 11.0)
+        self.assertEqual(merged["open_loop_rmse"], 0.7)
+        self.assertEqual(merged["smoothness_pullback_ratio"], 0.1)
+        self.assertEqual(merged["tegrastats_gr3d_freq_pct_max"], 92.0)
 
 
 if __name__ == "__main__":

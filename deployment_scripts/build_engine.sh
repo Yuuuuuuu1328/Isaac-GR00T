@@ -36,9 +36,10 @@ else   # one video view (default)
 fi
 
 # Define precision settings (can be overridden via environment variables)
-VIT_DTYPE=${VIT_DTYPE:-fp8}     # Options: fp16, fp8
-LLM_DTYPE=${LLM_DTYPE:-nvfp4}   # Options: fp16, nvfp4, nvfp4_full, fp8
-DIT_DTYPE=${DIT_DTYPE:-fp8}     # Options: fp16, fp8
+VIT_DTYPE=${VIT_DTYPE:-fp8}     # Options: fp16, fp8, int8
+LLM_DTYPE=${LLM_DTYPE:-nvfp4}   # Options: fp16, nvfp4, nvfp4_full, fp8, int8
+DIT_DTYPE=${DIT_DTYPE:-fp8}     # Options: fp16, fp8, int8
+ONNX_ROOT=${ONNX_ROOT:-gr00t_onnx}
 
 # Define max batch size (default 8, will be overridden for nvfp4 LLM variants)
 MAX_BATCH=${MAX_BATCH:-8}
@@ -47,11 +48,45 @@ echo "Building TensorRT engines with the following precisions:"
 echo "  ViT: ${VIT_DTYPE}"
 echo "  LLM: ${LLM_DTYPE}"
 echo "  DiT: ${DIT_DTYPE}"
+echo "  ONNX_ROOT: ${ONNX_ROOT}"
 echo "  Video Views: ${VIDEO_VIEWS}"
 echo "  MAX_BATCH: ${MAX_BATCH}"
 echo "  MIN_LEN: ${MIN_LEN}"
 echo "  OPT_LEN: ${OPT_LEN}"
 echo "  MAX_LEN: ${MAX_LEN}"
+
+# Validate model dtypes
+if [[ ! "$VIT_DTYPE" =~ ^(fp16|fp8|int8)$ ]]; then
+    echo "Error: VIT_DTYPE must be 'fp16', 'fp8', or 'int8', got '${VIT_DTYPE}'"
+    exit 1
+fi
+
+if [[ ! "$LLM_DTYPE" =~ ^(fp16|nvfp4|nvfp4_full|fp8|int8)$ ]]; then
+    echo "Error: LLM_DTYPE must be 'fp16', 'nvfp4', 'nvfp4_full', 'fp8', or 'int8', got '${LLM_DTYPE}'"
+    exit 1
+fi
+
+if [[ ! "$DIT_DTYPE" =~ ^(fp16|fp8|int8)$ ]]; then
+    echo "Error: DIT_DTYPE must be 'fp16', 'fp8', or 'int8', got '${DIT_DTYPE}'"
+    exit 1
+fi
+
+required_onnx_files=(
+    "${ONNX_ROOT}/action_head/vlln_vl_self_attention.onnx"
+    "${ONNX_ROOT}/action_head/DiT_${DIT_DTYPE}.onnx"
+    "${ONNX_ROOT}/action_head/state_encoder.onnx"
+    "${ONNX_ROOT}/action_head/action_encoder.onnx"
+    "${ONNX_ROOT}/action_head/action_decoder.onnx"
+    "${ONNX_ROOT}/eagle2/vit_${VIT_DTYPE}.onnx"
+    "${ONNX_ROOT}/eagle2/llm_${LLM_DTYPE}.onnx"
+)
+
+for onnx_file in "${required_onnx_files[@]}"; do
+    if [ ! -f "${onnx_file}" ]; then
+        echo "Error: required ONNX file not found: ${onnx_file}"
+        exit 1
+    fi
+done
 
 if [ ! -e /usr/src/tensorrt/bin/trtexec ]; then
     echo "The file /usr/src/tensorrt/bin/trtexec does not exist. Please install tensorrt"
@@ -62,35 +97,30 @@ mkdir -p gr00t_engine
 
 # VLLN-VLSelfAttention
 echo "------------Building vlln_vl_self_attention Model--------------------"
-trtexec --useCudaGraph --verbose --stronglyTyped --separateProfileRun --noDataTransfers --onnx=gr00t_onnx/action_head/vlln_vl_self_attention.onnx --saveEngine=gr00t_engine/vlln_vl_self_attention.engine --minShapes=backbone_features:1x${MIN_LEN}x2048 --optShapes=backbone_features:1x${OPT_LEN}x2048 --maxShapes=backbone_features:${MAX_BATCH}x${MAX_LEN}x2048 > gr00t_engine/vlln_vl_self_attention.log 2>&1
+trtexec --useCudaGraph --verbose --stronglyTyped --separateProfileRun --noDataTransfers --onnx=${ONNX_ROOT}/action_head/vlln_vl_self_attention.onnx --saveEngine=gr00t_engine/vlln_vl_self_attention.engine --minShapes=backbone_features:1x${MIN_LEN}x2048 --optShapes=backbone_features:1x${OPT_LEN}x2048 --maxShapes=backbone_features:${MAX_BATCH}x${MAX_LEN}x2048 > gr00t_engine/vlln_vl_self_attention.log 2>&1
 
 # DiT Model
 echo "------------Building DiT Model (${DIT_DTYPE})--------------------"
-trtexec --useCudaGraph --verbose --stronglyTyped --separateProfileRun --noDataTransfers --onnx=gr00t_onnx/action_head/DiT_${DIT_DTYPE}.onnx --saveEngine=gr00t_engine/DiT_${DIT_DTYPE}.engine --minShapes=sa_embs:1x49x1536,vl_embs:1x${MIN_LEN}x2048,timesteps_tensor:1  --optShapes=sa_embs:1x49x1536,vl_embs:1x${OPT_LEN}x2048,timesteps_tensor:1  --maxShapes=sa_embs:${MAX_BATCH}x49x1536,vl_embs:${MAX_BATCH}x${MAX_LEN}x2048,timesteps_tensor:${MAX_BATCH} > gr00t_engine/DiT_${DIT_DTYPE}.log 2>&1
+trtexec --useCudaGraph --verbose --stronglyTyped --separateProfileRun --noDataTransfers --onnx=${ONNX_ROOT}/action_head/DiT_${DIT_DTYPE}.onnx --saveEngine=gr00t_engine/DiT_${DIT_DTYPE}.engine --minShapes=sa_embs:1x49x1536,vl_embs:1x${MIN_LEN}x2048,timesteps_tensor:1  --optShapes=sa_embs:1x49x1536,vl_embs:1x${OPT_LEN}x2048,timesteps_tensor:1  --maxShapes=sa_embs:${MAX_BATCH}x49x1536,vl_embs:${MAX_BATCH}x${MAX_LEN}x2048,timesteps_tensor:${MAX_BATCH} > gr00t_engine/DiT_${DIT_DTYPE}.log 2>&1
 
 # State Encoder
 echo "------------Building State Encoder--------------------"
-trtexec --useCudaGraph --verbose --stronglyTyped --separateProfileRun --noDataTransfers --onnx=gr00t_onnx/action_head/state_encoder.onnx --saveEngine=gr00t_engine/state_encoder.engine --minShapes=state:1x1x64,embodiment_id:1  --optShapes=state:1x1x64,embodiment_id:1 --maxShapes=state:${MAX_BATCH}x1x64,embodiment_id:${MAX_BATCH} > gr00t_engine/state_encoder.log 2>&1
+trtexec --useCudaGraph --verbose --stronglyTyped --separateProfileRun --noDataTransfers --onnx=${ONNX_ROOT}/action_head/state_encoder.onnx --saveEngine=gr00t_engine/state_encoder.engine --minShapes=state:1x1x64,embodiment_id:1  --optShapes=state:1x1x64,embodiment_id:1 --maxShapes=state:${MAX_BATCH}x1x64,embodiment_id:${MAX_BATCH} > gr00t_engine/state_encoder.log 2>&1
 
 # Action Encoder
 echo "------------Building Action Encoder--------------------"
-trtexec --useCudaGraph --verbose --stronglyTyped --separateProfileRun --noDataTransfers --onnx=gr00t_onnx/action_head/action_encoder.onnx --saveEngine=gr00t_engine/action_encoder.engine --minShapes=actions:1x16x32,timesteps_tensor:1,embodiment_id:1  --optShapes=actions:1x16x32,timesteps_tensor:1,embodiment_id:1  --maxShapes=actions:${MAX_BATCH}x16x32,timesteps_tensor:${MAX_BATCH},embodiment_id:${MAX_BATCH} > gr00t_engine/action_encoder.log 2>&1
+trtexec --useCudaGraph --verbose --stronglyTyped --separateProfileRun --noDataTransfers --onnx=${ONNX_ROOT}/action_head/action_encoder.onnx --saveEngine=gr00t_engine/action_encoder.engine --minShapes=actions:1x16x32,timesteps_tensor:1,embodiment_id:1  --optShapes=actions:1x16x32,timesteps_tensor:1,embodiment_id:1  --maxShapes=actions:${MAX_BATCH}x16x32,timesteps_tensor:${MAX_BATCH},embodiment_id:${MAX_BATCH} > gr00t_engine/action_encoder.log 2>&1
 
 # Action Decoder
 echo "------------Building Action Decoder--------------------"
-trtexec --useCudaGraph --verbose --stronglyTyped --separateProfileRun --noDataTransfers --onnx=gr00t_onnx/action_head/action_decoder.onnx --saveEngine=gr00t_engine/action_decoder.engine --minShapes=model_output:1x49x1024,embodiment_id:1  --optShapes=model_output:1x49x1024,embodiment_id:1  --maxShapes=model_output:${MAX_BATCH}x49x1024,embodiment_id:${MAX_BATCH} > gr00t_engine/action_decoder.log 2>&1
+trtexec --useCudaGraph --verbose --stronglyTyped --separateProfileRun --noDataTransfers --onnx=${ONNX_ROOT}/action_head/action_decoder.onnx --saveEngine=gr00t_engine/action_decoder.engine --minShapes=model_output:1x49x1024,embodiment_id:1  --optShapes=model_output:1x49x1024,embodiment_id:1  --maxShapes=model_output:${MAX_BATCH}x49x1024,embodiment_id:${MAX_BATCH} > gr00t_engine/action_decoder.log 2>&1
 
 # VLM-ViT
 echo "------------Building VLM-ViT (${VIT_DTYPE})--------------------"
-trtexec --useCudaGraph --verbose --stronglyTyped --separateProfileRun --noDataTransfers --onnx=gr00t_onnx/eagle2/vit_${VIT_DTYPE}.onnx  --saveEngine=gr00t_engine/vit_${VIT_DTYPE}.engine --minShapes=pixel_values:1x3x224x224,position_ids:1x256 --optShapes=pixel_values:${VIDEO_VIEWS}x3x224x224,position_ids:${VIDEO_VIEWS}x256 --maxShapes=pixel_values:${MAX_BATCH}x3x224x224,position_ids:${MAX_BATCH}x256  > gr00t_engine/vit_${VIT_DTYPE}.log 2>&1
+trtexec --useCudaGraph --verbose --stronglyTyped --separateProfileRun --noDataTransfers --onnx=${ONNX_ROOT}/eagle2/vit_${VIT_DTYPE}.onnx  --saveEngine=gr00t_engine/vit_${VIT_DTYPE}.engine --minShapes=pixel_values:1x3x224x224,position_ids:1x256 --optShapes=pixel_values:${VIDEO_VIEWS}x3x224x224,position_ids:${VIDEO_VIEWS}x256 --maxShapes=pixel_values:${MAX_BATCH}x3x224x224,position_ids:${MAX_BATCH}x256  > gr00t_engine/vit_${VIT_DTYPE}.log 2>&1
 
 # VLM-LLM
 echo "------------Building VLM-LLM (${LLM_DTYPE})--------------------"
-# Validate LLM_DTYPE
-if [[ ! "$LLM_DTYPE" =~ ^(fp16|nvfp4|nvfp4_full|fp8)$ ]]; then
-    echo "Error: LLM_DTYPE must be 'fp16', 'nvfp4', 'nvfp4_full', or 'fp8', got '${LLM_DTYPE}'"
-    exit 1
-fi
 
 # Override max batch size for nvfp4 variants (require fixed shapes for Myelin)
 if [[ "$LLM_DTYPE" =~ ^nvfp4 ]]; then
@@ -100,7 +130,7 @@ else
 fi
 
 trtexec --useCudaGraph --verbose --stronglyTyped --separateProfileRun --noDataTransfers \
-    --onnx=gr00t_onnx/eagle2/llm_${LLM_DTYPE}.onnx \
+    --onnx=${ONNX_ROOT}/eagle2/llm_${LLM_DTYPE}.onnx \
     --saveEngine=gr00t_engine/llm_${LLM_DTYPE}.engine \
     --minShapes=inputs_embeds:1x${MIN_LEN}x2048,attention_mask:1x${MIN_LEN} \
     --optShapes=inputs_embeds:1x${OPT_LEN}x2048,attention_mask:1x${OPT_LEN} \

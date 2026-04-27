@@ -123,3 +123,5 @@ demo_data/gr00t-gr1-apple-to-shelf/
 tmp/
 output/
 .worktrees/
+
+gr00t_*/
