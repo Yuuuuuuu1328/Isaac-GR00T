@@ -69,11 +69,16 @@ def _get_dit_quant_cfg(precision: str):
         quant_cfg["quant_cfg"]["*softmax_quantizer"] = {"num_bits": (4, 3), "axis": None}
         return quant_cfg
     if precision == "int8":
-        return copy.deepcopy(mtq.INT8_DEFAULT_CFG)
+        quant_cfg = copy.deepcopy(mtq.INT8_DEFAULT_CFG)
+        # Disable BMM and softmax quantizers — INT8 precision is too coarse for these ops,
+        # causing numerical instability in attention scores.
+        quant_cfg["quant_cfg"]["*[qkv]_bmm_quantizer"] = {"enable": False}
+        quant_cfg["quant_cfg"]["*softmax_quantizer"] = {"enable": False}
+        return quant_cfg
     raise ValueError(f"Unsupported DiT precision: {precision}")
 
 
-def _get_llm_quant_cfg(precision: str, full_layer_quant: bool):
+def _get_llm_quant_cfg(precision: str, full_layer_quant: bool, int8_algo: str = "smoothquant"):
     if precision == "fp16":
         return None
     if precision == "nvfp4":
@@ -102,7 +107,29 @@ def _get_llm_quant_cfg(precision: str, full_layer_quant: bool):
     if precision == "fp8":
         return copy.deepcopy(mtq.FP8_DEFAULT_CFG)
     if precision == "int8":
-        return copy.deepcopy(mtq.INT8_DEFAULT_CFG)
+        if int8_algo == "smoothquant":
+            # SmoothQuant migrates quantization difficulty from activations to weights,
+            # significantly improving INT8 accuracy for transformer models (Orin NX target).
+            if hasattr(mtq, "INT8_SMOOTHQUANT_CFG"):
+                quant_cfg = copy.deepcopy(mtq.INT8_SMOOTHQUANT_CFG)
+            else:
+                quant_cfg = copy.deepcopy(mtq.INT8_DEFAULT_CFG)
+                quant_cfg["algorithm"] = {"method": "smoothquant", "alpha": 0.5}
+            print("Using INT8 SmoothQuant quantization for LLM")
+        else:
+            quant_cfg = copy.deepcopy(mtq.INT8_DEFAULT_CFG)
+            print("Using INT8 max (min/max) quantization for LLM")
+        if not full_layer_quant:
+            print("Using selective layer quantization (disabling down_proj and o_proj)")
+            quant_cfg["quant_cfg"][
+                "eagle_model.language_model.model.layers.*.mlp.down_proj.*_quantizer"
+            ] = {"enable": False}
+            quant_cfg["quant_cfg"][
+                "eagle_model.language_model.model.layers.*.self_attn.o_proj.*_quantizer"
+            ] = {"enable": False}
+        else:
+            print("Using full layer quantization (all layers enabled)")
+        return quant_cfg
     raise ValueError(f"Unsupported LLM precision: {precision}")
 
 
@@ -162,7 +189,7 @@ def build_parser():
         "--model-path",
         type=str,
         help="Path to the model",
-        default="/home/jetson/Desktop/project/model/gr00t_weights/GR00T-N1.5-3B",
+        default="nvidia/GR00T-N1.5-3B",
     )
 
     parser.add_argument(
@@ -221,7 +248,7 @@ def build_parser():
         "--calib-size",
         type=int,
         help="Number of calibration samples to use",
-        default=10,
+        default=32,
     )
 
     parser.add_argument(
@@ -242,7 +269,15 @@ def build_parser():
     parser.add_argument(
         "--full-layer-quant",
         action="store_true",
-        help="Enable full layer nvfp4 quantization for LLM (default: False, which disables down_proj and o_proj layers)",
+        help="Enable full layer quantization for LLM (default: False, which disables down_proj and o_proj layers). Applies to both nvfp4 and int8.",
+    )
+
+    parser.add_argument(
+        "--int8-algo",
+        type=str,
+        choices=["smoothquant", "max"],
+        help="INT8 quantization algorithm for LLM: smoothquant (recommended for Orin NX, better accuracy) or max (basic min/max calibration)",
+        default="smoothquant",
     )
 
     return parser
@@ -1027,6 +1062,7 @@ def quantize_llm(
     data_config="fourier_gr1_arms_only",
     model_path="nvidia/GR00T-N1.5-3B",
     full_layer_quant=False,
+    int8_algo="smoothquant",
 ):
     if mtq is None:
         raise ImportError("modelopt is required for quantization")
@@ -1037,7 +1073,7 @@ def quantize_llm(
         "int8",
     ], f"Only nvfp4 (W4A4), fp8, and int8 are supported. You passed an unsupported precision: {precision}."
 
-    quant_cfg = _get_llm_quant_cfg(precision, full_layer_quant)
+    quant_cfg = _get_llm_quant_cfg(precision, full_layer_quant, int8_algo)
 
     print(f"Quantization configuration: {quant_cfg}")
 
@@ -1274,6 +1310,7 @@ def export_eagle2_llm(
     model_path="nvidia/GR00T-N1.5-3B",
     video_backend="decord",
     full_layer_quant=False,
+    int8_algo="smoothquant",
 ):
     class EagleBackboneOpt(EagleBackbone):
         def __init__(self, **kwargs):
@@ -1322,6 +1359,7 @@ def export_eagle2_llm(
             video_backend=video_backend,
             full_layer_quant=full_layer_quant,
             compare_accuracy=False,
+            int8_algo=int8_algo,
         )
 
         # This is required for nvfp4 ONNX export
@@ -1347,7 +1385,9 @@ def export_eagle2_llm(
 
     # Use different filename for full layer quantization
     llm_dtype_suffix = (
-        f"{llm_dtype}_full" if (llm_dtype == "nvfp4" and full_layer_quant) else llm_dtype
+        f"{llm_dtype}_full"
+        if (llm_dtype in ("nvfp4", "int8") and full_layer_quant)
+        else llm_dtype
     )
     onnx_path = f"{output_dir}/eagle2/llm_{llm_dtype_suffix}.onnx"
     onnx_dir = os.path.dirname(onnx_path)
@@ -1606,9 +1646,10 @@ def run_groot_inference(
     vit_dtype: str = "fp16",
     dit_dtype: str = "fp16",
     calib_dataset_path: str = None,
-    calib_size: int = 10,
+    calib_size: int = 32,
     video_backend: str = "decord",
     full_layer_quant: bool = False,
+    int8_algo: str = "smoothquant",
 ) -> Dict[str, float]:
 
     # load the policy
@@ -1675,6 +1716,7 @@ def run_groot_inference(
         model_path=model_path,
         video_backend=video_backend,
         full_layer_quant=full_layer_quant,
+        int8_algo=int8_algo,
     )
     export_action_head(
         policy,
@@ -1713,6 +1755,7 @@ if __name__ == "__main__":
     print(f"Calibration dataset path: {args.calib_dataset_path or args.dataset_path}")
     print(f"Calibration size: {args.calib_size}")
     print(f"Full layer quantization: {args.full_layer_quant}")
+    print(f"INT8 algorithm: {args.int8_algo}")
 
     predicted_action = run_groot_inference(
         args.dataset_path,
@@ -1728,6 +1771,7 @@ if __name__ == "__main__":
         calib_size=args.calib_size,
         video_backend=args.video_backend,
         full_layer_quant=args.full_layer_quant,
+        int8_algo=args.int8_algo,
     )
 
     for key, value in predicted_action.items():

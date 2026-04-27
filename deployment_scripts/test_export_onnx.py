@@ -27,17 +27,58 @@ class ExportOnnxQuantConfigTest(unittest.TestCase):
         self.assertEqual(quant_cfg["algorithm"], export_onnx.mtq.INT8_DEFAULT_CFG["algorithm"])
         self.assertIsNot(quant_cfg, export_onnx.mtq.INT8_DEFAULT_CFG)
 
-    def test_llm_quant_config_supports_int8(self):
-        quant_cfg = export_onnx._get_llm_quant_cfg("int8", full_layer_quant=False)
+    def test_llm_quant_config_int8_max(self):
+        quant_cfg = export_onnx._get_llm_quant_cfg("int8", full_layer_quant=False, int8_algo="max")
 
         self.assertEqual(quant_cfg["algorithm"], export_onnx.mtq.INT8_DEFAULT_CFG["algorithm"])
         self.assertIsNot(quant_cfg, export_onnx.mtq.INT8_DEFAULT_CFG)
+
+    def test_llm_quant_config_int8_smoothquant(self):
+        quant_cfg = export_onnx._get_llm_quant_cfg(
+            "int8", full_layer_quant=False, int8_algo="smoothquant"
+        )
+
+        self.assertIsNotNone(quant_cfg)
+        self.assertIn("quant_cfg", quant_cfg)
+        # SmoothQuant config should NOT match basic INT8 default algorithm
+        if hasattr(export_onnx.mtq, "INT8_SMOOTHQUANT_CFG"):
+            self.assertIsNot(quant_cfg, export_onnx.mtq.INT8_SMOOTHQUANT_CFG)
+        else:
+            self.assertEqual(
+                quant_cfg["algorithm"], {"method": "smoothquant", "alpha": 0.5}
+            )
+
+    def test_llm_quant_config_int8_selective_layers(self):
+        quant_cfg = export_onnx._get_llm_quant_cfg(
+            "int8", full_layer_quant=False, int8_algo="max"
+        )
+
+        down_proj_key = (
+            "eagle_model.language_model.model.layers.*.mlp.down_proj.*_quantizer"
+        )
+        o_proj_key = (
+            "eagle_model.language_model.model.layers.*.self_attn.o_proj.*_quantizer"
+        )
+        self.assertFalse(quant_cfg["quant_cfg"][down_proj_key]["enable"])
+        self.assertFalse(quant_cfg["quant_cfg"][o_proj_key]["enable"])
+
+    def test_llm_quant_config_int8_full_layer(self):
+        quant_cfg = export_onnx._get_llm_quant_cfg(
+            "int8", full_layer_quant=True, int8_algo="max"
+        )
+
+        down_proj_key = (
+            "eagle_model.language_model.model.layers.*.mlp.down_proj.*_quantizer"
+        )
+        self.assertNotIn(down_proj_key, quant_cfg["quant_cfg"])
 
     def test_dit_quant_config_supports_int8(self):
         quant_cfg = export_onnx._get_dit_quant_cfg("int8")
 
         self.assertEqual(quant_cfg["algorithm"], export_onnx.mtq.INT8_DEFAULT_CFG["algorithm"])
         self.assertIsNot(quant_cfg, export_onnx.mtq.INT8_DEFAULT_CFG)
+        self.assertFalse(quant_cfg["quant_cfg"]["*[qkv]_bmm_quantizer"]["enable"])
+        self.assertFalse(quant_cfg["quant_cfg"]["*softmax_quantizer"]["enable"])
 
 
 class ExportOnnxCalibrationPolicyTest(unittest.TestCase):
