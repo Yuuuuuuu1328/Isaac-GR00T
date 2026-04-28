@@ -261,7 +261,7 @@ def build_parser():
     parser.add_argument(
         "--video-backend",
         type=str,
-        choices=["decord", "torchcodec"],
+        choices=["decord", "torchcodec", "opencv"],
         help="Video backend to use for loading video frames",
         default="decord",
     )
@@ -697,75 +697,69 @@ def _quantize_dit_model(model, calib_dataloader, quant_cfg, action_head):
     Custom calibration loop for DiT model that runs the full denoising process.
     DiT requires multiple forward passes (typically 4 steps) for proper calibration.
     """
+    # Convert action_head sub-modules (action_encoder, future_tokens, action_decoder,
+    # position_embedding, state_encoder) to the same dtype as the DiT model (float16).
+    # Without this, these modules remain in bfloat16 (from model config), and mixing
+    # bfloat16 + float16 in torch.cat promotes everything to float32, causing OOM.
+    dit_dtype = next(model.parameters()).dtype
+    action_head.to(dit_dtype)
 
     def calibrate_loop(model):
         """Run the denoising loop for DiT calibration."""
+        model_dtype = next(model.parameters()).dtype
         for idx, data in enumerate(calib_dataloader):
             if idx % 10 == 0:
                 print(f"Calibrating DiT batch {idx}...")
 
-            # Move data to device
             device = next(model.parameters()).device
-            vl_embs = data["vl_embs"].to(device)
-            state_features = data["state_features"].to(device)
-            actions = data["actions"].to(device)
+            vl_embs = data["vl_embs"].to(device=device, dtype=model_dtype)
+            state_features = data["state_features"].to(device=device, dtype=model_dtype)
+            actions = data["actions"].to(device=device, dtype=model_dtype)
             embodiment_id = data["embodiment_id"].to(device)
 
             batch_size = vl_embs.shape[0]
             num_steps = action_head.num_inference_timesteps
             dt = 1.0 / num_steps
 
-            # Run denoising steps (typically 4 steps)
             for t in range(num_steps):
                 t_cont = t / float(num_steps)
                 t_discretized = int(t_cont * action_head.num_timestep_buckets)
 
-                # Embed noised action trajectory
                 timesteps_tensor = torch.full(
                     size=(batch_size,), fill_value=t_discretized, device=device
                 )
                 action_features = action_head.action_encoder(
                     actions, timesteps_tensor, embodiment_id
-                )
+                ).to(model_dtype)
 
-                # Maybe add position embedding
                 if action_head.config.add_pos_embed:
                     pos_ids = torch.arange(
                         action_features.shape[1], dtype=torch.long, device=device
                     )
                     pos_embs = action_head.position_embedding(pos_ids).unsqueeze(0)
-                    action_features = action_features + pos_embs
+                    action_features = action_features + pos_embs.to(model_dtype)
 
-                # Join state, future tokens, and action embeddings
                 future_tokens = action_head.future_tokens.weight.unsqueeze(0).expand(
                     batch_size, -1, -1
-                )
+                ).to(model_dtype)
                 sa_embs = torch.cat((state_features, future_tokens, action_features), dim=1)
 
-                # Run DiT model forward (this is what we're calibrating)
-                sa_embs_float16 = sa_embs.to(torch.float16)
-                vl_embs_float16 = vl_embs.to(torch.float16)
-
-                # Forward pass through model being calibrated (output not used, just for calibration)
                 _ = model(
-                    hidden_states=sa_embs_float16,
-                    encoder_hidden_states=vl_embs_float16,
+                    hidden_states=sa_embs,
+                    encoder_hidden_states=vl_embs,
                     timestep=timesteps_tensor,
                 )
 
-                # Forward pass through original model
                 model_output = action_head.model(
                     hidden_states=sa_embs,
                     encoder_hidden_states=vl_embs,
                     timestep=timesteps_tensor,
                 )
 
-                # Decode predictions
                 pred = action_head.action_decoder(model_output, embodiment_id)
                 pred_velocity = pred[:, -action_head.config.action_horizon :]
 
-                # Update actions using euler integration
-                actions = actions + dt * pred_velocity
+                actions = (actions + dt * pred_velocity).to(model_dtype)
 
     print("Starting DiT quantization with multi-step denoising...")
     start_time = time.time()
@@ -1556,7 +1550,8 @@ def export_action_head(
     )
 
     # DiT model with optional FP8 or INT8 quantization
-    DiT = policy.model.action_head.model.to(torch.float16).cuda()
+    dit_model_dtype = torch.float16
+    DiT = policy.model.action_head.model.to(dit_model_dtype).cuda()
 
     # Quantize DiT if requested
     if dit_dtype in ["fp8", "int8"]:
@@ -1589,11 +1584,11 @@ def export_action_head(
             + policy.model.action_head.config.num_target_vision_tokens,
             policy.model.action_head.config.input_embedding_dim,
         ),
-        dtype=torch.float16,
+        dtype=dit_model_dtype,
     ).cuda()
     vl_embs_tensor = torch.randn(
         (1, attention_mask.shape[1], policy.model.action_head.config.backbone_embedding_dim),
-        dtype=torch.float16,
+        dtype=dit_model_dtype,
     ).cuda()
 
     onnx_path = os.path.join(ONNX_export_path, f"action_head/DiT_{dit_dtype}.onnx")
