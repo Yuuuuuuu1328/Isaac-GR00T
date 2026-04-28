@@ -427,10 +427,9 @@ class AistudioRuntime:
         *,
         model_batch: dict[str, Any],
     ) -> tuple[np.ndarray, dict[str, float]]:
-        t0 = time.perf_counter_ns()
-        action_result = self.policy.get_action(model_batch)
-        sync_cuda_if_needed()
-        get_action_ms = round((time.perf_counter_ns() - t0) / 1_000_000.0, 4)
+        action_result, get_action_ms = measure_cuda_time_ms(
+            lambda: self.policy.get_action(model_batch)
+        )
 
         model_forward_ms = 0.0
         if (
