@@ -704,16 +704,22 @@ def _collect_detail_timing(policy) -> dict[str, float]:
 
     # Backbone sub-timings (Vision Encoder, LLM)
     if "_vit_start" in detail and "_vit_end" in detail:
-        result["vision_encoder_ms"] = round(
-            float(detail["_vit_start"].elapsed_time(detail["_vit_end"])), 4
-        )
+        try:
+            result["vision_encoder_ms"] = round(
+                float(detail["_vit_start"].elapsed_time(detail["_vit_end"])), 4
+            )
+        except RuntimeError:
+            result["vision_encoder_ms"] = 0.0
     else:
         result["vision_encoder_ms"] = 0.0
 
     if "_llm_start" in detail and "_llm_end" in detail:
-        result["llm_ms"] = round(
-            float(detail["_llm_start"].elapsed_time(detail["_llm_end"])), 4
-        )
+        try:
+            result["llm_ms"] = round(
+                float(detail["_llm_start"].elapsed_time(detail["_llm_end"])), 4
+            )
+        except RuntimeError:
+            result["llm_ms"] = 0.0
     else:
         result["llm_ms"] = 0.0
 
@@ -723,7 +729,10 @@ def _collect_detail_timing(policy) -> dict[str, float]:
         events = detail.get(f"_{comp_name}_events", [])
         total_ms = 0.0
         for s, e in events:
-            total_ms += float(s.elapsed_time(e))
+            try:
+                total_ms += float(s.elapsed_time(e))
+            except RuntimeError:
+                pass
         result[f"{comp_name}_ms"] = round(total_ms, 4)
 
     return result
@@ -792,6 +801,8 @@ class AistudioRuntime:
         return action_result["action.single_arm"], timing
 
     def predict_with_timing(self, payload: dict) -> tuple[dict, dict[str, Any]]:
+        import traceback as _tb
+
         parsed: dict[str, Any] | None = None
         timing = _empty_timing()
         try:
@@ -811,8 +822,18 @@ class AistudioRuntime:
                 (time.perf_counter_ns() - t_pre_start) / 1_000_000.0, 4
             )
 
-            previous_actions, infer_timing = self._predict_previous_actions(model_batch=batch)
-            timing.update(infer_timing)
+            t_infer_start = time.perf_counter_ns()
+            try:
+                previous_actions, infer_timing = self._predict_previous_actions(model_batch=batch)
+                timing.update(infer_timing)
+            except Exception as infer_exc:
+                infer_wall_ms = round(
+                    (time.perf_counter_ns() - t_infer_start) / 1_000_000.0, 4
+                )
+                timing["get_action_ms"] = infer_wall_ms
+                print(f"[predict_with_timing] Inference error: {infer_exc}")
+                _tb.print_exc()
+                raise
 
             t_post_start = time.perf_counter_ns()
             action_string, is_success = postprocess_actions(
@@ -837,6 +858,7 @@ class AistudioRuntime:
             }
             return build_aistudio_response(result_map=result_map), timing
         except Exception as exc:
+            print(f"[predict_with_timing] Error: {exc}")
             request_id = "" if parsed is None else str(parsed.get("request_id", ""))
             device_id = "" if parsed is None else str(parsed.get("device_id", ""))
             return (
@@ -1142,6 +1164,13 @@ def run_client_benchmark(args: argparse.Namespace) -> int:
                 success_count += 1
             else:
                 failure_count += 1
+                error_msg = body.get("errorMessage", "")
+                result_map = body.get("resultMap", {})
+                error_detail = result_map.get("error", "") if isinstance(result_map, dict) else ""
+                print(
+                    f"  [run {run_index}] FAILED: "
+                    f"{error_msg or error_detail or 'unknown error'}"
+                )
 
             _append_jsonl_record(
                 args.output_jsonl,
@@ -1201,7 +1230,7 @@ def run_client_benchmark(args: argparse.Namespace) -> int:
     )
 
     W = 20
-    print(f"\n=== Average Latency ({args.measure_runs} runs) ===")
+    print(f"\n=== Average Latency ({args.measure_runs} runs, {success_count} ok / {failure_count} failed) ===")
     print(f"  Client round-trip:        {avg['client_total_ms']:>{W}.4f} ms")
     print(f"  +-- Network RTT:          {avg['network_rtt_ms']:>{W}.4f} ms  (client_total - server_total)")
     print(f"  +-- Server total:         {avg['server_total_ms']:>{W}.4f} ms  (wall clock)")
