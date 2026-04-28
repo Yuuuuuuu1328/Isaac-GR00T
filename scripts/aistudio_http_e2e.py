@@ -813,7 +813,7 @@ def run_client_benchmark(args: argparse.Namespace) -> int:
     print(f"  +-- Network RTT:          {avg['network_rtt_ms']:>{W}.4f} ms  (client_total - server_total)")
     print(f"  +-- Server total:         {avg['server_total_ms']:>{W}.4f} ms  (wall clock)")
     print(f"      +-- Preprocess:       {avg['preprocess_ms']:>{W}.4f} ms  (JSON parse + JPEG decode + cv2 + batch)")
-    print(f"      +-- get_action:       {avg['get_action_ms']:>{W}.4f} ms  (wall clock, transforms + GPU)")
+    print(f"      +-- get_action:       {avg['get_action_ms']:>{W}.4f} ms  (CUDA events, transforms + GPU)")
     print(f"      |   +-- Transforms:   {avg['transform_ms']:>{W}.4f} ms  (VideoToTensor/Crop/Resize/Norm/VLM tokenize)")
     print(f"      |   +-- Model fwd:    {avg['model_forward_ms']:>{W}.4f} ms  (backbone + action_head, CUDA events)")
     print(f"      |   +-- Other:        {other_ms:>{W}.4f} ms  (batch prep + unapply + squeeze)")
