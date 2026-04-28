@@ -16,17 +16,17 @@ from fastapi.websockets import WebSocketDisconnect
 
 from deployment_scripts.ant import ossfs_gr00t_runtime as _ossfs_runtime_helper
 from deployment_scripts.trt_model_forward import setup_tensorrt_engines
-from deployment_scripts.ant.profile_utils import measure_cuda_time_ms
+from deployment_scripts.ant.profile_utils import measure_cuda_time_ms, sync_cuda_if_needed
 try:
     from websocket import create_connection as websocket_create_connection
 except ModuleNotFoundError:  # pragma: no cover - handled by runtime/tests
     websocket_create_connection = None
 
 
-DEFAULT_MODEL_PATH = "/home/jetson/Desktop/project/new_model/left_hand_v2_1223"
-DEFAULT_OSSFS_WORKSPACE = "/home/jetson/Desktop/project/ossfs/node_59823209/workspace"
+DEFAULT_MODEL_PATH = "/home/ningjiang/nj/ckpt/gr00t/left_hand_v2_1223"
+DEFAULT_OSSFS_WORKSPACE = "/home/ningjiang/nj/ossfs/node_59823209/workspace"
 DEFAULT_TRT_ENGINE_PATH = (
-    "/home/jetson/Desktop/project/Isaac-GR00T/gr00t_engine_new_interaction_group_fp16"
+    "/home/ningjiang/nj/Isaac-GR00T/gr00t_engine_int8_new09"
 )
 DEFAULT_TASK_PROMPT = "book"
 DEFAULT_DATA_CONFIG = "new_interaction_group"
@@ -230,20 +230,12 @@ def send_request(
     body = envelope.get("result", {})
     if not isinstance(body, dict):
         raise ValueError("WebSocket response missing object result")
-    latency = envelope.get("latency", {})
-    if not isinstance(latency, dict):
-        latency = {}
+    server_latency = envelope.get("latency", {})
+    if not isinstance(server_latency, dict):
+        server_latency = {}
     response = SimpleNamespace(
         status_code=int(envelope.get("status_code", 200) or 200),
-        headers=build_latency_headers(
-            server_total_ms=_coerce_latency_ms(latency.get("server_total_ms", 0.0)),
-            pure_inference_ms=_coerce_latency_ms(latency.get("pure_inference_ms", 0.0)),
-            server_overhead_ms=_coerce_latency_ms(latency.get("server_overhead_ms", 0.0)),
-        ),
-        latency_breakdown={
-            "preprocess_ms": _coerce_latency_ms(latency.get("preprocess_ms", 0.0)),
-            "postprocess_ms": _coerce_latency_ms(latency.get("postprocess_ms", 0.0)),
-        },
+        server_latency=server_latency,
         json=lambda: body,
     )
     return response, client_round_trip_ms
@@ -382,17 +374,43 @@ def _coerce_latency_ms(value: Any, *, default: float = 0.0) -> float:
         return round(default, 4)
 
 
-def build_latency_headers(
-    *,
-    server_total_ms: float,
-    pure_inference_ms: float,
-    server_overhead_ms: float,
-) -> dict[str, str]:
+
+def _install_timing_hooks(policy) -> None:
+    import torch
+
+    _orig_forward = policy._get_action_from_normalized_input
+    _orig_transforms = policy.apply_transforms
+
+    def _timed_forward(normalized_input):
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        result = _orig_forward(normalized_input)
+        end.record()
+        policy._timing_fwd_start = start
+        policy._timing_fwd_end = end
+        return result
+
+    def _timed_transforms(obs):
+        t0 = time.perf_counter_ns()
+        result = _orig_transforms(obs)
+        policy._timing_transform_ns = time.perf_counter_ns() - t0
+        return result
+
+    policy._get_action_from_normalized_input = _timed_forward
+    policy.apply_transforms = _timed_transforms
+    policy._timing_fwd_start = None
+    policy._timing_fwd_end = None
+    policy._timing_transform_ns = 0
+
+
+def _empty_timing() -> dict[str, float]:
     return {
-        "X-Server-Total-Ms": str(_coerce_latency_ms(server_total_ms)),
-        "X-Pure-Inference-Ms": str(_coerce_latency_ms(pure_inference_ms)),
-        "X-Inference-Ms": str(_coerce_latency_ms(pure_inference_ms)),
-        "X-Server-Overhead-Ms": str(_coerce_latency_ms(server_overhead_ms)),
+        "preprocess_ms": 0.0,
+        "get_action_ms": 0.0,
+        "model_forward_ms": 0.0,
+        "transform_ms": 0.0,
+        "postprocess_ms": 0.0,
     }
 
 
@@ -408,19 +426,33 @@ class AistudioRuntime:
         self,
         *,
         model_batch: dict[str, Any],
-    ) -> tuple[np.ndarray, float]:
-        def _infer_func():
-            return self.policy.get_action(model_batch)
+    ) -> tuple[np.ndarray, dict[str, float]]:
+        t0 = time.perf_counter_ns()
+        action_result = self.policy.get_action(model_batch)
+        sync_cuda_if_needed()
+        get_action_ms = round((time.perf_counter_ns() - t0) / 1_000_000.0, 4)
 
-        action_result, gpu_infer_ms = measure_cuda_time_ms(_infer_func)
-        previous_actions = action_result["action.single_arm"]
-        return previous_actions, gpu_infer_ms
+        model_forward_ms = 0.0
+        if (
+            getattr(self.policy, "_timing_fwd_start", None) is not None
+            and getattr(self.policy, "_timing_fwd_end", None) is not None
+        ):
+            model_forward_ms = round(
+                float(self.policy._timing_fwd_start.elapsed_time(self.policy._timing_fwd_end)), 4
+            )
+        transform_ms = round(
+            getattr(self.policy, "_timing_transform_ns", 0) / 1_000_000.0, 4
+        )
+
+        return action_result["action.single_arm"], {
+            "get_action_ms": get_action_ms,
+            "model_forward_ms": model_forward_ms,
+            "transform_ms": transform_ms,
+        }
 
     def predict_with_timing(self, payload: dict) -> tuple[dict, dict[str, Any]]:
         parsed: dict[str, Any] | None = None
-        get_action_ms = 0.0
-        preprocess_ms = 0.0
-        postprocess_ms = 0.0
+        timing = _empty_timing()
         try:
             t_pre_start = time.perf_counter_ns()
             parsed = parse_aistudio_query(payload)
@@ -434,11 +466,12 @@ class AistudioRuntime:
                 robot_state=robot_state,
                 task_prompt=self.task_prompt,
             )
-            preprocess_ms = round(
+            timing["preprocess_ms"] = round(
                 (time.perf_counter_ns() - t_pre_start) / 1_000_000.0, 4
             )
 
-            previous_actions, get_action_ms = self._predict_previous_actions(model_batch=batch)
+            previous_actions, infer_timing = self._predict_previous_actions(model_batch=batch)
+            timing.update(infer_timing)
 
             t_post_start = time.perf_counter_ns()
             action_string, is_success = postprocess_actions(
@@ -446,7 +479,7 @@ class AistudioRuntime:
                 robot_state,
                 response_action_horizon=self.response_action_horizon,
             )
-            postprocess_ms = round(
+            timing["postprocess_ms"] = round(
                 (time.perf_counter_ns() - t_post_start) / 1_000_000.0, 4
             )
 
@@ -461,14 +494,7 @@ class AistudioRuntime:
                 "device_id": parsed.get("device_id", ""),
                 "request_id": parsed.get("request_id", ""),
             }
-            return build_aistudio_response(result_map=result_map), {
-                "request_id": str(parsed.get("request_id", "")),
-                "device_id": str(parsed.get("device_id", "")),
-                "backend": str(self.metadata.get("backend", "")),
-                "get_action_ms": get_action_ms,
-                "preprocess_ms": preprocess_ms,
-                "postprocess_ms": postprocess_ms,
-            }
+            return build_aistudio_response(result_map=result_map), timing
         except Exception as exc:
             request_id = "" if parsed is None else str(parsed.get("request_id", ""))
             device_id = "" if parsed is None else str(parsed.get("device_id", ""))
@@ -481,14 +507,7 @@ class AistudioRuntime:
                     predicted_coords_2d=[] if parsed is None else parsed.get("predicted_coords_2d", []),
                     history_angles=[] if parsed is None else parsed.get("history_angles", []),
                 ),
-                {
-                    "request_id": request_id,
-                    "device_id": device_id,
-                    "backend": str(self.metadata.get("backend", "")),
-                    "get_action_ms": get_action_ms,
-                    "preprocess_ms": preprocess_ms,
-                    "postprocess_ms": postprocess_ms,
-                },
+                timing,
             )
 
 
@@ -499,31 +518,28 @@ def create_app(*, runtime, ws_path: str = DEFAULT_WS_PATH):
     @app.websocket(ws_path)
     async def ws_predict(websocket: WebSocket):
         await websocket.accept()
-        # 外层循环：保证单个连接异常后，服务依然存活，继续处理下一次请求
         while True:
             try:
-                # 接收消息
                 raw_payload = await websocket.receive_text()
-                
-                # 业务处理
+
                 request_start_ns = time.perf_counter_ns()
                 try:
                     payload = json.loads(raw_payload)
                     response_body, timing = runtime.predict_with_timing(payload)
                 except Exception as exc:
                     response_body = build_aistudio_error_response(error_message=str(exc))
-                    timing = {
-                        "get_action_ms": 0.0,
-                        "preprocess_ms": 0.0,
-                        "postprocess_ms": 0.0,
-                    }
+                    timing = _empty_timing()
 
-                server_total_ms = round((time.perf_counter_ns() - request_start_ns) / 1_000_000.0, 4)
-                get_action_ms = _coerce_latency_ms(timing.get("get_action_ms", 0.0))
+                server_total_ms = round(
+                    (time.perf_counter_ns() - request_start_ns) / 1_000_000.0, 4
+                )
                 preprocess_ms = _coerce_latency_ms(timing.get("preprocess_ms", 0.0))
+                get_action_ms = _coerce_latency_ms(timing.get("get_action_ms", 0.0))
+                model_forward_ms = _coerce_latency_ms(timing.get("model_forward_ms", 0.0))
+                transform_ms = _coerce_latency_ms(timing.get("transform_ms", 0.0))
                 postprocess_ms = _coerce_latency_ms(timing.get("postprocess_ms", 0.0))
                 server_overhead_ms = max(
-                    round(server_total_ms - get_action_ms - preprocess_ms - postprocess_ms, 4),
+                    round(server_total_ms - preprocess_ms - get_action_ms - postprocess_ms, 4),
                     0.0,
                 )
 
@@ -532,20 +548,19 @@ def create_app(*, runtime, ws_path: str = DEFAULT_WS_PATH):
                     "result": response_body,
                     "latency": {
                         "server_total_ms": _coerce_latency_ms(server_total_ms),
-                        "get_action_ms": get_action_ms,
                         "preprocess_ms": preprocess_ms,
+                        "get_action_ms": get_action_ms,
+                        "model_forward_ms": model_forward_ms,
+                        "transform_ms": transform_ms,
                         "postprocess_ms": postprocess_ms,
                         "server_overhead_ms": _coerce_latency_ms(server_overhead_ms),
                     },
                 })
 
-            # 客户端断开连接 → 只退出当前连接，服务不关闭
             except WebSocketDisconnect:
                 break
-
-            # 任何其他异常 → 打印日志，但服务继续运行
             except Exception as e:
-                print(f"[WebSocket 异常] 连接处理出错，服务继续运行: {str(e)}")
+                print(f"[WebSocket error] {str(e)}")
                 continue
 
 
@@ -627,28 +642,6 @@ def run_server(app, *, host: str, port: int) -> None:
     uvicorn.run(app, host=host, port=port)
 
 
-def _parse_latency_header(response, header_name: str) -> float:
-    try:
-        return round(float(response.headers.get(header_name, "nan")), 4)
-    except (TypeError, ValueError):
-        return float("nan")
-
-
-def _resolve_nonzero_inference_ms(
-    *,
-    pure_inference_ms: float,
-    server_total_ms: float,
-    client_round_trip_ms: float,
-) -> float:
-    candidates = (pure_inference_ms, server_total_ms, client_round_trip_ms)
-    for candidate in candidates:
-        if np.isnan(candidate):
-            continue
-        if candidate > 0.0:
-            return round(candidate, 4)
-    return 0.0
-
-
 def _append_jsonl_record(output_path: str | Path, record: dict[str, Any]) -> None:
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -676,14 +669,23 @@ def _fetch_server_metadata(host: str, port: int) -> dict:
         return {}
 
 
+_LATENCY_KEYS = (
+    "client_total_ms",
+    "server_total_ms",
+    "preprocess_ms",
+    "get_action_ms",
+    "model_forward_ms",
+    "transform_ms",
+    "postprocess_ms",
+    "server_overhead_ms",
+    "network_rtt_ms",
+)
+
+
 def run_client_benchmark(args: argparse.Namespace) -> int:
     rng = np.random.default_rng(args.seed)
     host = _host_for_role(args)
-    total_latency_sum = 0.0
-    infer_latency_sum = 0.0
-    network_latency_sum = 0.0
-    preprocess_latency_sum = 0.0
-    postprocess_latency_sum = 0.0
+    sums: dict[str, float] = {k: 0.0 for k in _LATENCY_KEYS}
     success_count = 0
     failure_count = 0
     config_snapshot = _json_safe(vars(args))
@@ -701,14 +703,10 @@ def run_client_benchmark(args: argparse.Namespace) -> int:
         payload = build_request_payload(args, request_id=request_id, rng=rng)
         try:
             send_request(
-                host=host,
-                port=args.port,
-                ws_path=args.ws_path,
-                payload=payload,
-                timeout_ms=args.timeout_ms,
+                host=host, port=args.port, ws_path=args.ws_path,
+                payload=payload, timeout_ms=args.timeout_ms,
             )
         except Exception:
-            # Warmup errors are ignored by design; run phase records persistent metrics.
             pass
 
     for run_index in range(args.measure_runs):
@@ -716,41 +714,38 @@ def run_client_benchmark(args: argparse.Namespace) -> int:
         payload = build_request_payload(args, request_id=request_id, rng=rng)
         timestamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
         try:
-            response, total_latency_ms = send_request(
-                host=host,
-                port=args.port,
-                ws_path=args.ws_path,
-                payload=payload,
-                timeout_ms=args.timeout_ms,
+            response, client_total_ms = send_request(
+                host=host, port=args.port, ws_path=args.ws_path,
+                payload=payload, timeout_ms=args.timeout_ms,
             )
             body = response.json()
             result_code = int(body.get("resultCode", 1))
             actual_request_id = body.get("resultMap", {}).get("request_id", request_id)
 
-            server_total_ms = _parse_latency_header(response, "X-Server-Total-Ms")
-            pure_inference_ms = _parse_latency_header(response, "X-Pure-Inference-Ms")
-            if np.isnan(pure_inference_ms):
-                pure_inference_ms = _parse_latency_header(response, "X-Inference-Ms")
-            pure_inference_ms = _resolve_nonzero_inference_ms(
-                server_total_ms=server_total_ms,
-                pure_inference_ms=pure_inference_ms,
-                client_round_trip_ms=total_latency_ms,
-            )
-            breakdown = getattr(response, "latency_breakdown", {})
-            preprocess_ms = _coerce_latency_ms(breakdown.get("preprocess_ms", 0.0))
-            postprocess_ms = _coerce_latency_ms(breakdown.get("postprocess_ms", 0.0))
-            network_latency_ms = round(max(total_latency_ms - pure_inference_ms, 0.0), 4)
-            inference_proportion_pct = (
-                round((pure_inference_ms / total_latency_ms) * 100.0, 2)
-                if total_latency_ms > 0.0
-                else 0.0
-            )
+            sl = response.server_latency
+            server_total_ms = _coerce_latency_ms(sl.get("server_total_ms", 0.0))
+            preprocess_ms = _coerce_latency_ms(sl.get("preprocess_ms", 0.0))
+            get_action_ms = _coerce_latency_ms(sl.get("get_action_ms", 0.0))
+            model_forward_ms = _coerce_latency_ms(sl.get("model_forward_ms", 0.0))
+            transform_ms = _coerce_latency_ms(sl.get("transform_ms", 0.0))
+            postprocess_ms = _coerce_latency_ms(sl.get("postprocess_ms", 0.0))
+            server_overhead_ms = _coerce_latency_ms(sl.get("server_overhead_ms", 0.0))
+            network_rtt_ms = round(max(client_total_ms - server_total_ms, 0.0), 4)
 
-            total_latency_sum += total_latency_ms
-            infer_latency_sum += pure_inference_ms
-            network_latency_sum += network_latency_ms
-            preprocess_latency_sum += preprocess_ms
-            postprocess_latency_sum += postprocess_ms
+            row = {
+                "client_total_ms": client_total_ms,
+                "server_total_ms": server_total_ms,
+                "preprocess_ms": preprocess_ms,
+                "get_action_ms": get_action_ms,
+                "model_forward_ms": model_forward_ms,
+                "transform_ms": transform_ms,
+                "postprocess_ms": postprocess_ms,
+                "server_overhead_ms": server_overhead_ms,
+                "network_rtt_ms": network_rtt_ms,
+            }
+            for k in _LATENCY_KEYS:
+                sums[k] += row[k]
+
             if result_code == 0:
                 success_count += 1
             else:
@@ -770,22 +765,7 @@ def run_client_benchmark(args: argparse.Namespace) -> int:
                         "http_status": int(getattr(response, "status_code", 0) or 0),
                         "result_code": result_code,
                     },
-                    "latency": {
-                        "total_latency_ms": round(total_latency_ms, 4),
-                        "pure_inference_ms": round(pure_inference_ms, 4),
-                        "preprocess_ms": preprocess_ms,
-                        "postprocess_ms": postprocess_ms,
-                        "network_latency_ms": round(network_latency_ms, 4),
-                        "inference_proportion_pct": inference_proportion_pct,
-                    },
-                    "server_headers": {
-                        "X-Server-Total-Ms": server_total_ms,
-                        "X-Pure-Inference-Ms": pure_inference_ms,
-                        "X-Inference-Ms": pure_inference_ms,
-                        "X-Server-Overhead-Ms": _parse_latency_header(
-                            response, "X-Server-Overhead-Ms"
-                        ),
-                    },
+                    "latency": row,
                     "response": {
                         "resultCode": result_code,
                         "errorMessage": _to_ascii_text(body.get("errorMessage", "")),
@@ -809,13 +789,7 @@ def run_client_benchmark(args: argparse.Namespace) -> int:
                         "http_status": 0,
                         "result_code": 1,
                     },
-                    "latency": {
-                        "total_latency_ms": 0.0,
-                        "pure_inference_ms": 0.0,
-                        "network_latency_ms": 0.0,
-                        "inference_proportion_pct": 0.0,
-                    },
-                    "server_headers": {},
+                    "latency": {k: 0.0 for k in _LATENCY_KEYS},
                     "response": {
                         "resultCode": 1,
                         "errorMessage": _to_ascii_text(exc),
@@ -824,26 +798,29 @@ def run_client_benchmark(args: argparse.Namespace) -> int:
                 },
             )
 
-    run_count = max(args.measure_runs, 1)
-    average_total = total_latency_sum / run_count
-    average_inference = infer_latency_sum / run_count
-    average_network = network_latency_sum / run_count
-    average_preprocess = preprocess_latency_sum / run_count
-    average_postprocess = postprocess_latency_sum / run_count
-    average_proportion = (
-        (infer_latency_sum / total_latency_sum) * 100.0 if total_latency_sum > 0.0 else 0.0
+    n = max(args.measure_runs, 1)
+    avg = {k: round(v / n, 4) for k, v in sums.items()}
+    other_ms = round(
+        max(avg["get_action_ms"] - avg["model_forward_ms"] - avg["transform_ms"], 0.0), 4
+    )
+    gpu_ratio = (
+        round(avg["model_forward_ms"] / avg["client_total_ms"] * 100.0, 2)
+        if avg["client_total_ms"] > 0.0 else 0.0
     )
 
-    average_server_total = average_preprocess + average_inference + average_postprocess
-
-    print("\n=== Average Latency ===")
-    print(f"  Total (client round-trip):     {average_total:.4f} ms")
-    print(f"  Server total:                  {average_server_total:.4f} ms")
-    print(f"    Preprocess (CPU):            {average_preprocess:.4f} ms")
-    print(f"    get_action (CUDA evt):       {average_inference:.4f} ms")
-    print(f"    Postprocess (CPU):           {average_postprocess:.4f} ms")
-    print(f"  Network:                       {average_network:.4f} ms")
-    print(f"  Inference proportion:          {average_proportion:.2f}%")
+    W = 20
+    print(f"\n=== Average Latency ({args.measure_runs} runs) ===")
+    print(f"  Client round-trip:        {avg['client_total_ms']:>{W}.4f} ms")
+    print(f"  +-- Network RTT:          {avg['network_rtt_ms']:>{W}.4f} ms  (client_total - server_total)")
+    print(f"  +-- Server total:         {avg['server_total_ms']:>{W}.4f} ms  (wall clock)")
+    print(f"      +-- Preprocess:       {avg['preprocess_ms']:>{W}.4f} ms  (JSON parse + JPEG decode + cv2 + batch)")
+    print(f"      +-- get_action:       {avg['get_action_ms']:>{W}.4f} ms  (wall clock, transforms + GPU)")
+    print(f"      |   +-- Transforms:   {avg['transform_ms']:>{W}.4f} ms  (VideoToTensor/Crop/Resize/Norm/VLM tokenize)")
+    print(f"      |   +-- Model fwd:    {avg['model_forward_ms']:>{W}.4f} ms  (backbone + action_head, CUDA events)")
+    print(f"      |   +-- Other:        {other_ms:>{W}.4f} ms  (batch prep + unapply + squeeze)")
+    print(f"      +-- Postprocess:      {avg['postprocess_ms']:>{W}.4f} ms  (action integration)")
+    print(f"      +-- Server overhead:  {avg['server_overhead_ms']:>{W}.4f} ms  (JSON parse + framework)")
+    print(f"  GPU inference ratio:      {gpu_ratio:>{W}.2f} %  (model_forward / client_total)")
 
     _append_jsonl_record(
         args.output_jsonl,
@@ -851,13 +828,10 @@ def run_client_benchmark(args: argparse.Namespace) -> int:
             "record_type": "summary",
             "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             "config": config_snapshot,
-            "summary_metrics": {
-                "average_total_latency_ms": round(average_total, 4),
-                "average_inference_latency_ms": round(average_inference, 4),
-                "average_preprocess_ms": round(average_preprocess, 4),
-                "average_postprocess_ms": round(average_postprocess, 4),
-                "average_network_latency_ms": round(average_network, 4),
-                "average_inference_proportion_pct": round(average_proportion, 2),
+            "summary_metrics": {f"avg_{k}": avg[k] for k in _LATENCY_KEYS},
+            "derived": {
+                "avg_other_ms": other_ms,
+                "gpu_inference_ratio_pct": gpu_ratio,
             },
             "run_count": int(args.measure_runs),
             "success_count": success_count,
@@ -872,6 +846,7 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.role == "server":
         runtime = build_runtime(args)
+        _install_timing_hooks(runtime.policy)
         app = create_app(runtime=runtime, ws_path=args.ws_path)
         run_server(app, host=_host_for_role(args), port=args.port)
         return 0

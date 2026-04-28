@@ -147,10 +147,11 @@ class ServerSurfaceTest(unittest.TestCase):
                         }
                     ),
                     {
-                        "request_id": "req-1",
-                        "device_id": "dev-1",
-                        "backend": "tensorrt",
-                        "pure_inference_ms": 10.0,
+                        "preprocess_ms": 5.0,
+                        "get_action_ms": 10.0,
+                        "model_forward_ms": 7.0,
+                        "transform_ms": 2.5,
+                        "postprocess_ms": 0.1,
                     },
                 )
             ),
@@ -188,27 +189,32 @@ class ServerSurfaceTest(unittest.TestCase):
         body = envelope["result"]
         self.assertEqual(body["resultCode"], 0)
         self.assertEqual(body["resultMap"]["request_id"], "req-1")
-        self.assertEqual(envelope["latency"]["server_total_ms"], 25.0)
-        self.assertEqual(envelope["latency"]["pure_inference_ms"], 10.0)
-        self.assertEqual(envelope["latency"]["server_overhead_ms"], 15.0)
+        latency = envelope["latency"]
+        self.assertEqual(latency["server_total_ms"], 25.0)
+        self.assertEqual(latency["get_action_ms"], 10.0)
+        self.assertEqual(latency["model_forward_ms"], 7.0)
+        self.assertEqual(latency["transform_ms"], 2.5)
+        self.assertEqual(latency["preprocess_ms"], 5.0)
+        self.assertEqual(latency["postprocess_ms"], 0.1)
+        self.assertIn("server_overhead_ms", latency)
 
 
 class ClientLatencyAndJsonlTest(unittest.TestCase):
     @staticmethod
     def _fake_response(request_id: str):
-        class _Response:
-            status_code = 200
-            headers = {
-                "X-Server-Total-Ms": "25.0",
-                "X-Pure-Inference-Ms": "10.0",
-                "X-Inference-Ms": "10.0",
-                "X-Server-Overhead-Ms": "15.0",
-            }
-
-            def json(self):
-                return {"resultCode": 0, "errorMessage": "ok", "resultMap": {"request_id": request_id}}
-
-        return _Response()
+        return SimpleNamespace(
+            status_code=200,
+            server_latency={
+                "server_total_ms": 30.0,
+                "preprocess_ms": 12.0,
+                "get_action_ms": 15.0,
+                "model_forward_ms": 8.0,
+                "transform_ms": 5.0,
+                "postprocess_ms": 0.5,
+                "server_overhead_ms": 2.5,
+            },
+            json=lambda: {"resultCode": 0, "errorMessage": "ok", "resultMap": {"request_id": request_id}},
+        )
 
     def test_client_prints_required_average_latency_block_and_writes_run_plus_summary(self):
         module = _load_module()
@@ -246,11 +252,13 @@ class ClientLatencyAndJsonlTest(unittest.TestCase):
 
             self.assertEqual(exit_code, 0)
             output = stdout.getvalue()
-            self.assertIn("=== Average Latency ===", output)
-            self.assertIn("Average total latency: 40.00000 ms", output)
-            self.assertIn("Average inference latency: 10.00000 ms", output)
-            self.assertIn("Average network latency: 30.00000 ms", output)
-            self.assertIn("Average inference proportion: 25.00%", output)
+            self.assertIn("=== Average Latency (10 runs) ===", output)
+            self.assertIn("Client round-trip:", output)
+            self.assertIn("Network RTT:", output)
+            self.assertIn("Server total:", output)
+            self.assertIn("Model fwd:", output)
+            self.assertIn("Transforms:", output)
+            self.assertIn("GPU inference ratio:", output)
 
             records = [json.loads(line) for line in output_path.read_text(encoding="ascii").splitlines()]
             run_records = [record for record in records if record["record_type"] == "run"]
@@ -258,7 +266,11 @@ class ClientLatencyAndJsonlTest(unittest.TestCase):
             self.assertEqual(len(run_records), 10)
             self.assertEqual(len(summary_records), 1)
             self.assertEqual(run_records[0]["request_meta"]["phase"], "run")
-            self.assertEqual(summary_records[0]["summary_metrics"]["average_total_latency_ms"], 40.0)
+            lat = run_records[0]["latency"]
+            self.assertEqual(lat["client_total_ms"], 40.0)
+            self.assertEqual(lat["server_total_ms"], 30.0)
+            self.assertEqual(lat["model_forward_ms"], 8.0)
+            self.assertEqual(lat["network_rtt_ms"], 10.0)
             self.assertEqual(summary_records[0]["run_count"], 10)
 
     def test_client_fails_fast_when_websocket_dependency_is_missing(self):
