@@ -416,7 +416,7 @@ def _install_transform_timing_hooks(policy) -> None:
         return
 
     for i, transform in enumerate(transforms.transforms):
-        _orig_apply = transform.__call__
+        _orig_apply = transform.apply
         cls_name = type(transform).__name__
 
         def _make_timed(orig, name, idx):
@@ -428,7 +428,7 @@ def _install_transform_timing_hooks(policy) -> None:
                 return result
             return _timed
 
-        transform.__call__ = _make_timed(_orig_apply, cls_name, i)
+        object.__setattr__(transform, "apply", _make_timed(_orig_apply, cls_name, i))
 
 
 def _install_backbone_timing_hooks(policy) -> None:
@@ -448,31 +448,40 @@ def _install_backbone_timing_hooks(policy) -> None:
     if is_trt:
         def _timed_backbone_forward(vl_input):
             detail = policy._detail_timing
-            eagle_prefix = "eagle_"
-            eagle_input = {
-                k.removeprefix(eagle_prefix): v
-                for k, v in vl_input.items()
-                if k.startswith(eagle_prefix)
-            }
+
+            _orig_vit_fwd = backbone.vit_engine.forward
+            _orig_llm_fwd = backbone.llm_engine.forward
 
             vit_start = torch.cuda.Event(enable_timing=True)
             vit_end = torch.cuda.Event(enable_timing=True)
             llm_start = torch.cuda.Event(enable_timing=True)
             llm_end = torch.cuda.Event(enable_timing=True)
 
-            vit_start.record()
-            result = _orig_backbone_forward(vl_input)
-            llm_end.record()
-            torch.cuda.synchronize()
+            def _timed_vit(*args, **kwargs):
+                vit_start.record()
+                res = _orig_vit_fwd(*args, **kwargs)
+                vit_end.record()
+                return res
+
+            def _timed_llm(*args, **kwargs):
+                llm_start.record()
+                res = _orig_llm_fwd(*args, **kwargs)
+                llm_end.record()
+                return res
+
+            backbone.vit_engine.forward = _timed_vit
+            backbone.llm_engine.forward = _timed_llm
+            try:
+                result = _orig_backbone_forward(vl_input)
+            finally:
+                backbone.vit_engine.forward = _orig_vit_fwd
+                backbone.llm_engine.forward = _orig_llm_fwd
 
             detail["_vit_start"] = vit_start
             detail["_vit_end"] = vit_end
             detail["_llm_start"] = llm_start
             detail["_llm_end"] = llm_end
-
-            _hook_trt_backbone_engines(backbone, detail)
-            result_again = _orig_backbone_forward(vl_input)
-            return result_again
+            return result
     else:
         def _timed_backbone_forward(vl_input):
             detail = policy._detail_timing
@@ -538,41 +547,6 @@ def _install_backbone_timing_hooks(policy) -> None:
     backbone.forward = _timed_backbone_forward
 
 
-def _hook_trt_backbone_engines(backbone, detail):
-    import torch
-
-    if hasattr(backbone, "vit_engine"):
-        _orig_vit_call = backbone.vit_engine.__call__
-
-        def _timed_vit(*args, **kwargs):
-            s = torch.cuda.Event(enable_timing=True)
-            e = torch.cuda.Event(enable_timing=True)
-            s.record()
-            res = _orig_vit_call(*args, **kwargs)
-            e.record()
-            detail["_vit_start"] = s
-            detail["_vit_end"] = e
-            backbone.vit_engine.__call__ = _orig_vit_call
-            return res
-
-        backbone.vit_engine.__call__ = _timed_vit
-
-    if hasattr(backbone, "llm_engine"):
-        _orig_llm_call = backbone.llm_engine.__call__
-
-        def _timed_llm(*args, **kwargs):
-            s = torch.cuda.Event(enable_timing=True)
-            e = torch.cuda.Event(enable_timing=True)
-            s.record()
-            res = _orig_llm_call(*args, **kwargs)
-            e.record()
-            detail["_llm_start"] = s
-            detail["_llm_end"] = e
-            backbone.llm_engine.__call__ = _orig_llm_call
-            return res
-
-        backbone.llm_engine.__call__ = _timed_llm
-
 
 def _install_action_head_timing_hooks(policy) -> None:
     import torch
@@ -595,11 +569,11 @@ def _install_action_head_timing_hooks(policy) -> None:
                         "dit_block", "action_decoder"):
                 detail[f"_{key}_events"] = []
 
-            _orig_vlln = action_head.vlln_vl_self_attention_engine.__call__
-            _orig_state = action_head.state_encoder_engine.__call__
-            _orig_ae = action_head.action_encoder_engine.__call__
-            _orig_dit = action_head.DiT_engine.__call__
-            _orig_ad = action_head.action_decoder_engine.__call__
+            _orig_vlln = action_head.vlln_vl_self_attention_engine.forward
+            _orig_state = action_head.state_encoder_engine.forward
+            _orig_ae = action_head.action_encoder_engine.forward
+            _orig_dit = action_head.DiT_engine.forward
+            _orig_ad = action_head.action_decoder_engine.forward
 
             def _wrap(orig, name):
                 def _timed(*args, **kwargs):
@@ -612,20 +586,20 @@ def _install_action_head_timing_hooks(policy) -> None:
                     return res
                 return _timed
 
-            action_head.vlln_vl_self_attention_engine.__call__ = _wrap(_orig_vlln, "features_process")
-            action_head.state_encoder_engine.__call__ = _wrap(_orig_state, "state_encoder")
-            action_head.action_encoder_engine.__call__ = _wrap(_orig_ae, "action_encoder")
-            action_head.DiT_engine.__call__ = _wrap(_orig_dit, "dit_block")
-            action_head.action_decoder_engine.__call__ = _wrap(_orig_ad, "action_decoder")
+            action_head.vlln_vl_self_attention_engine.forward = _wrap(_orig_vlln, "features_process")
+            action_head.state_encoder_engine.forward = _wrap(_orig_state, "state_encoder")
+            action_head.action_encoder_engine.forward = _wrap(_orig_ae, "action_encoder")
+            action_head.DiT_engine.forward = _wrap(_orig_dit, "dit_block")
+            action_head.action_decoder_engine.forward = _wrap(_orig_ad, "action_decoder")
 
             try:
                 result = _orig_get_action(backbone_output, action_input)
             finally:
-                action_head.vlln_vl_self_attention_engine.__call__ = _orig_vlln
-                action_head.state_encoder_engine.__call__ = _orig_state
-                action_head.action_encoder_engine.__call__ = _orig_ae
-                action_head.DiT_engine.__call__ = _orig_dit
-                action_head.action_decoder_engine.__call__ = _orig_ad
+                action_head.vlln_vl_self_attention_engine.forward = _orig_vlln
+                action_head.state_encoder_engine.forward = _orig_state
+                action_head.action_encoder_engine.forward = _orig_ae
+                action_head.DiT_engine.forward = _orig_dit
+                action_head.action_decoder_engine.forward = _orig_ad
 
             return result
     else:
