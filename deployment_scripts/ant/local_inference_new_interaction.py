@@ -37,7 +37,7 @@ _TRT_LLM_DTYPE_CHOICES = ["fp16", "nvfp4", "fp8", "int8"]
 _BACKEND_CHOICES = ["pytorch", "tensorrt"]
 _MODE_CHOICES = ["e2e", "breakdown"]
 _DEFAULT_EXPERIMENT_RESULT_JSONL = (
-    _REPO_ROOT / "deployment_scripts/ant/output/local_inference_new_interaction_result.jsonl"
+    _REPO_ROOT / "deployment_scripts/ant/output/local_inference_new_interaction_result_fp16.jsonl"
 )
 _OSSFS_WORKSPACE = _ossfs_runtime_helper._OSSFS_WORKSPACE
 _ensure_ossfs_gr00t_on_path = _ossfs_runtime_helper._ensure_ossfs_gr00t_on_path
@@ -74,7 +74,7 @@ def _add_common_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser
     parser.add_argument("--data-config", type=str, default="new_interaction_group")
     parser.add_argument("--embodiment-tag", type=str, default="new_embodiment")
     parser.add_argument("--denoising-steps", type=int, default=4)
-    parser.add_argument("--video-backend", type=str, choices=["decord"], default="decord")
+    parser.add_argument("--video-backend", type=str, choices=["decord", "opencv", "torchcodec", "torchvision_av"], default="decord")
     parser.add_argument("--sample-index", type=int, default=0)
     parser.add_argument("--warmup-runs", type=int, default=10)
     parser.add_argument("--measure-runs", type=int, default=30)

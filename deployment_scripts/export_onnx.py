@@ -17,6 +17,7 @@ import argparse
 import copy
 import os
 import time
+from collections import Counter
 from typing import Dict, Optional
 
 import modelopt.torch.quantization as mtq
@@ -140,8 +141,6 @@ def _rewrite_layernorm_initializers_for_float_inputs(onnx_path):
     for node in onnx_model.graph.node:
         if node.op_type != "LayerNormalization" or len(node.input) < 3:
             continue
-        if "layer_norm2" not in node.name:
-            continue
 
         for initializer_name in node.input[1:3]:
             initializer = initializer_map.get(initializer_name)
@@ -151,6 +150,221 @@ def _rewrite_layernorm_initializers_for_float_inputs(onnx_path):
             initializer.CopyFrom(numpy_helper.from_array(tensor, name=initializer_name))
 
     onnx.save_model(onnx_model, os.fspath(onnx_path))
+
+
+def _configure_llm_modelopt_onnx_quantizers(model, precision: str, tag: str = "LLM"):
+    """
+    Configure ModelOpt quantizers before torch.onnx.export for the LLM path only.
+
+    Why LLM-only?
+      - ViT and DiT already exported valid Q/DQ graphs in the original pipeline.
+      - Applying this configuration globally can force ViT/DiT activations through
+        Float-side Q/DQ and inflate ONNX files dramatically.
+      - The observed failure was specific to the LLM path: LLM INT8 previously did
+        not preserve Q/DQ into ONNX/TensorRT.
+
+    Export convention:
+      - activation/input quantizer: dynamic
+      - weight quantizer: static
+      - INT8 input Q/DQ high precision dtype: Float, safest for mixed FP16/FP32 graphs
+      - NVFP4 keeps Half, matching the original NVIDIA export path
+      - FP8 does not force _trt_high_precision_dtype
+    """
+    if precision not in ["int8", "fp8", "nvfp4"]:
+        return
+
+    try:
+        from modelopt.torch.quantization.utils import is_quantized_linear
+    except Exception as e:
+        print(f"[{tag}] Warning: cannot import is_quantized_linear: {e}")
+        return
+
+    n_linear = 0
+    n_qlinear = 0
+    n_input_q = 0
+    n_weight_q = 0
+
+    for name, module in model.named_modules():
+        if not isinstance(module, torch.nn.Linear):
+            continue
+
+        n_linear += 1
+
+        if not is_quantized_linear(module):
+            continue
+
+        n_qlinear += 1
+
+        if hasattr(module, "input_quantizer"):
+            module.input_quantizer._onnx_quantizer_type = "dynamic"
+
+            if precision == "int8":
+                # LLM export can contain Float-side Q/DQ. ModelOpt requires either
+                # the dtype to match the ONNX input type or the Q/DQ to be Float.
+                module.input_quantizer._trt_high_precision_dtype = "Float"
+            elif precision == "nvfp4":
+                # Preserve original NVIDIA NVFP4 behavior.
+                module.input_quantizer._trt_high_precision_dtype = "Half"
+            # For FP8, leave _trt_high_precision_dtype untouched.
+
+            n_input_q += 1
+
+        if hasattr(module, "weight_quantizer"):
+            module.weight_quantizer._onnx_quantizer_type = "static"
+            n_weight_q += 1
+
+    print(
+        f"[{tag}] configured LLM ONNX quantizers for {precision}: "
+        f"quantized_linears={n_qlinear}/{n_linear}, "
+        f"input_quantizers={n_input_q}, weight_quantizers={n_weight_q}"
+    )
+
+    if precision == "int8" and n_qlinear == 0:
+        print(f"[{tag}] WARNING: no quantized Linear layers found for INT8 LLM export.")
+
+
+def _inspect_torch_quantization(model, tag: str = "model"):
+    """
+    Inspect whether ModelOpt quantization was actually injected into the PyTorch model.
+    This check happens before ONNX export.
+    """
+    print(f"\n===== Inspect PyTorch quantization: {tag} =====")
+
+    try:
+        from modelopt.torch.quantization.utils import is_quantized_linear
+    except Exception as e:
+        print(f"[{tag}] Warning: cannot import is_quantized_linear: {e}")
+        return
+
+    total_linears = 0
+    quantized_linears = 0
+    total_quantizers = 0
+    enabled_quantizers = 0
+
+    for name, module in model.named_modules():
+        if isinstance(module, torch.nn.Linear):
+            total_linears += 1
+            if is_quantized_linear(module):
+                quantized_linears += 1
+                print(f"[{tag}] QLinear: {name}")
+
+        cls_name = module.__class__.__name__
+        if "Quantizer" in cls_name:
+            total_quantizers += 1
+
+            enabled = None
+            if hasattr(module, "is_enabled"):
+                try:
+                    enabled = module.is_enabled()
+                except Exception:
+                    enabled = getattr(module, "_enabled", None)
+            else:
+                enabled = getattr(module, "_enabled", None)
+
+            if enabled:
+                enabled_quantizers += 1
+
+            print(f"[{tag}] Quantizer: {name}, class={cls_name}, enabled={enabled}")
+
+    print(f"[{tag}] total_linears={total_linears}")
+    print(f"[{tag}] quantized_linears={quantized_linears}")
+    print(f"[{tag}] total_quantizers={total_quantizers}")
+    print(f"[{tag}] enabled_quantizers={enabled_quantizers}")
+
+    if total_quantizers == 0:
+        print(f"[{tag}] ERROR: no quantizers found in PyTorch model.")
+    if quantized_linears == 0:
+        print(f"[{tag}] ERROR: no quantized Linear modules found.")
+
+
+def _inspect_onnx_qdq(onnx_path: str, tag: str = "onnx"):
+    """
+    Inspect whether exported ONNX contains Q/DQ nodes.
+    This is the most important check for TensorRT explicit quantization.
+    """
+    print(f"\n===== Inspect ONNX Q/DQ: {tag} =====")
+
+    if not os.path.exists(onnx_path):
+        print(f"[{tag}] ERROR: ONNX file does not exist: {onnx_path}")
+        return
+
+    try:
+        onnx_model = onnx.load(onnx_path, load_external_data=False)
+    except Exception as e:
+        print(f"[{tag}] ERROR: failed to load ONNX model: {e}")
+        return
+
+    op_counts = Counter(node.op_type for node in onnx_model.graph.node)
+
+    for op, cnt in op_counts.most_common(30):
+        print(f"[{tag}] {op}: {cnt}")
+
+    q = op_counts.get("QuantizeLinear", 0)
+    dq = op_counts.get("DequantizeLinear", 0)
+    matmul = op_counts.get("MatMul", 0)
+    gemm = op_counts.get("Gemm", 0)
+
+    print(f"[{tag}] QuantizeLinear={q}, DequantizeLinear={dq}")
+    print(f"[{tag}] MatMul={matmul}, Gemm={gemm}")
+
+    if q == 0 and dq == 0:
+        print(f"[{tag}] WARNING: ONNX has no Q/DQ nodes. Quantization may not be exported.")
+    else:
+        print(f"[{tag}] OK: ONNX contains Q/DQ nodes.")
+
+
+def _inspect_onnx_initializer_dtypes(onnx_path: str, tag: str = "onnx"):
+    """
+    Inspect ONNX initializer data types. Useful for checking whether weights are
+    still mostly FP16 or have been converted to INT8/UINT8.
+    """
+    print(f"\n===== Inspect ONNX initializer dtypes: {tag} =====")
+
+    if not os.path.exists(onnx_path):
+        print(f"[{tag}] ERROR: ONNX file does not exist: {onnx_path}")
+        return
+
+    try:
+        onnx_model = onnx.load(onnx_path, load_external_data=False)
+    except Exception as e:
+        print(f"[{tag}] ERROR: failed to load ONNX model: {e}")
+        return
+
+    dtype_counts = Counter(init.data_type for init in onnx_model.graph.initializer)
+
+    dtype_name = {
+        TensorProto.FLOAT: "FLOAT32",
+        TensorProto.FLOAT16: "FLOAT16",
+        TensorProto.BFLOAT16: "BFLOAT16",
+        TensorProto.INT8: "INT8",
+        TensorProto.UINT8: "UINT8",
+        TensorProto.INT32: "INT32",
+        TensorProto.INT64: "INT64",
+    }
+
+    for dtype, cnt in dtype_counts.items():
+        print(f"[{tag}] {dtype_name.get(dtype, dtype)}: {cnt}")
+
+    int8_count = dtype_counts.get(TensorProto.INT8, 0) + dtype_counts.get(TensorProto.UINT8, 0)
+    fp16_count = dtype_counts.get(TensorProto.FLOAT16, 0)
+    fp32_count = dtype_counts.get(TensorProto.FLOAT, 0)
+
+    print(f"[{tag}] INT8/UINT8 initializers={int8_count}")
+    print(f"[{tag}] FP16 initializers={fp16_count}")
+    print(f"[{tag}] FP32 initializers={fp32_count}")
+
+
+def _print_onnx_file_size(onnx_path: str, tag: str = "onnx"):
+    """
+    Print ONNX file size. If external data is used, this only prints the main
+    .onnx file size, not the external tensor data file.
+    """
+    if not os.path.exists(onnx_path):
+        print(f"[{tag}] ONNX file does not exist: {onnx_path}")
+        return
+
+    size_mb = os.path.getsize(onnx_path) / 1024 / 1024
+    print(f"[{tag}] ONNX file size: {size_mb:.2f} MB, path={onnx_path}")
 
 
 def _resolve_calibration_policy(
@@ -261,7 +475,7 @@ def build_parser():
     parser.add_argument(
         "--video-backend",
         type=str,
-        choices=["decord", "torchcodec", "opencv"],
+        choices=["decord", "torchcodec", "opencv", "torchvision_av"],
         help="Video backend to use for loading video frames",
         default="decord",
     )
@@ -298,21 +512,9 @@ class ViTCalibrationDataset(Dataset):
         calib_size: int = 100,
         video_backend: str = "decord",
     ):
-        """
-        Initialize the ViT calibration dataset.
-
-        Args:
-            dataset_path: Path to the LeRobot dataset
-            modality_configs: Modality configuration for the dataset
-            embodiment_tag: Embodiment tag for the dataset
-            policy: Gr00tPolicy instance for using apply_transforms()
-            calib_size: Number of calibration samples to use
-            video_backend: Video backend for loading videos
-        """
         self.calib_size = calib_size
         self.policy = policy
 
-        # Initialize the LeRobot dataset
         self.lerobot_dataset = LeRobotSingleDataset(
             dataset_path=dataset_path,
             modality_configs=modality_configs,
@@ -320,7 +522,6 @@ class ViTCalibrationDataset(Dataset):
             video_backend=video_backend,
         )
 
-        # Use sequential indices for calibration
         self.dataset_size = len(self.lerobot_dataset)
         print(f"ViT Dataset size: {self.dataset_size}")
         self.calib_size = min(calib_size, self.dataset_size)
@@ -329,10 +530,7 @@ class ViTCalibrationDataset(Dataset):
         return self.calib_size
 
     def __getitem__(self, idx):
-        # Use sequential indices directly
         data = self.lerobot_dataset[idx]
-
-        # Process the data to get pixel_values and position_ids for ViT
         processed_data = self._process_vit_data(data)
         return processed_data
 
@@ -341,19 +539,15 @@ class ViTCalibrationDataset(Dataset):
         Process LeRobot data to extract pixel_values and position_ids for ViT calibration.
         """
         try:
-            # Ensure data is in the correct format for apply_transforms
             is_batch = self.policy._check_state_is_batched(data)
             if not is_batch:
                 data = unsqueeze_dict_values(data)
 
-            # Apply the same transforms as used in training/inference
             transformed_data = self.policy.apply_transforms(data)
 
-            # Check if we have eagle pixel values
             if "eagle_pixel_values" in transformed_data:
                 pixel_values = transformed_data["eagle_pixel_values"]
                 batch_size = pixel_values.shape[0]
-                # Generate position_ids for the patches
                 num_patches = (
                     self.policy.model.backbone.eagle_model.vision_model.vision_model.embeddings.num_patches
                 )
@@ -390,23 +584,10 @@ class LLMCalibrationDataset(Dataset):
         video_backend: str = "decord",
         enable_comparison: bool = False,
     ):
-        """
-        Initialize the LeRobot calibration dataset.
-
-        Args:
-            dataset_path: Path to the LeRobot dataset
-            modality_configs: Modality configuration for the dataset
-            embodiment_tag: Embodiment tag for the dataset
-            policy: Gr00tPolicy instance for using apply_transforms()
-            calib_size: Number of calibration samples to use
-            video_backend: Video backend for loading videos
-            enable_comparison: Whether to enable input_embeds comparison with saved file
-        """
         self.calib_size = calib_size
         self.policy = policy
         self.enable_comparison = enable_comparison
 
-        # Initialize the LeRobot dataset
         self.lerobot_dataset = LeRobotSingleDataset(
             dataset_path=dataset_path,
             modality_configs=modality_configs,
@@ -414,7 +595,6 @@ class LLMCalibrationDataset(Dataset):
             video_backend=video_backend,
         )
 
-        # Use sequential indices for calibration
         self.dataset_size = len(self.lerobot_dataset)
         print(f"Dataset size: {self.dataset_size}")
         self.calib_size = min(calib_size, self.dataset_size)
@@ -423,12 +603,8 @@ class LLMCalibrationDataset(Dataset):
         return self.calib_size
 
     def __getitem__(self, idx):
-        # Use sequential indices directly
         data = self.lerobot_dataset[idx]
-
-        # Process the data to get input_ids, vit_embeds, and attention_mask
         processed_data = self._process_llm_data(data)
-
         return processed_data
 
     def _process_llm_data(self, data):
@@ -436,30 +612,21 @@ class LLMCalibrationDataset(Dataset):
         Process LLM data to extract input_ids, vit_embeds, and attention_mask
         for LLM calibration using apply_transforms() for consistent data processing.
         """
-        # Use apply_transforms() for consistent data processing
         try:
-            # Ensure data is in the correct format for apply_transforms
             is_batch = self.policy._check_state_is_batched(data)
             if not is_batch:
                 data = unsqueeze_dict_values(data)
 
-            # Apply the same transforms as used in training/inference
             transformed_data = self.policy.apply_transforms(data)
 
-            # Check if we have eagle data (from apply_transforms)
             if "eagle_input_ids" in transformed_data and "eagle_pixel_values" in transformed_data:
-                # Use the already processed eagle data
                 pixel_values = transformed_data["eagle_pixel_values"]
                 input_ids = transformed_data["eagle_input_ids"]
                 attention_mask = transformed_data["eagle_attention_mask"]
 
-                # Extract vit_embeds using the actual ViT model from the policy
                 try:
-                    # Use the policy's eagle model for consistent feature extraction
                     with torch.no_grad():
-                        # Move pixel_values to CUDA before feature extraction
                         pixel_values = pixel_values.to("cuda")
-                        # Extract vit_embeds using the policy's eagle model
                         if self.policy.model.backbone.eagle_model.select_layer == -1:
                             vit_embeds = self.policy.model.backbone.eagle_model.vision_model(
                                 pixel_values=pixel_values,
@@ -485,10 +652,8 @@ class LLMCalibrationDataset(Dataset):
                     vit_embeds = vit_embeds.reshape(vit_embeds.shape[0], h, w, -1)
                     vit_embeds = self.policy.model.backbone.pixel_shuffle(
                         vit_embeds, scale_factor=self.policy.model.backbone.downsample_ratio
-                    )  # torch.Size([B, 1024, 1024]) -> torch.Size([B, 16, 16, 4096])
-                    vit_embeds = vit_embeds.reshape(
-                        vit_embeds.shape[0], -1, vit_embeds.shape[-1]
-                    )  # torch.Size([B, 16, 16, 4096]) -> torch.Size([B, 256, 4096])
+                    )
+                    vit_embeds = vit_embeds.reshape(vit_embeds.shape[0], -1, vit_embeds.shape[-1])
 
                 if (
                     self.policy.model.backbone.eagle_model.mlp_checkpoint
@@ -500,10 +665,8 @@ class LLMCalibrationDataset(Dataset):
                 else:
                     vit_embeds = self.policy.model.backbone.eagle_model.mlp1(vit_embeds)
 
-                # Move input_ids to the same device as the model
                 input_ids = input_ids.to(next(self.policy.model.parameters()).device)
 
-                # Get input_ids from vl_input and convert to embeddings
                 input_embeds = (
                     self.policy.model.backbone.eagle_model.language_model.get_input_embeddings()(
                         input_ids
@@ -531,8 +694,6 @@ class LLMCalibrationDataset(Dataset):
                     input_embeds[selected] = input_embeds[selected] * 0.0 + vit_embeds[:n_token]
 
                 input_embeds = input_embeds.reshape(B, N, C)
-
-                # Convert to float16 for quantization compatibility
                 input_embeds = input_embeds.to(torch.float16)
 
                 return {
@@ -540,7 +701,6 @@ class LLMCalibrationDataset(Dataset):
                     "attention_mask": attention_mask,
                 }
             else:
-                # If eagle data is not available, raise an error
                 raise RuntimeError(
                     "eagle data not found in transformed_data. This indicates an issue with apply_transforms()."
                 )
@@ -564,21 +724,9 @@ class DiTCalibrationDataset(Dataset):
         calib_size: int = 100,
         video_backend: str = "decord",
     ):
-        """
-        Initialize the DiT calibration dataset.
-
-        Args:
-            dataset_path: Path to the LeRobot dataset
-            modality_configs: Modality configuration for the dataset
-            embodiment_tag: Embodiment tag for the dataset
-            policy: Gr00tPolicy instance for using apply_transforms()
-            calib_size: Number of calibration samples to use
-            video_backend: Video backend for loading videos
-        """
         self.calib_size = calib_size
         self.policy = policy
 
-        # Initialize the LeRobot dataset
         self.lerobot_dataset = LeRobotSingleDataset(
             dataset_path=dataset_path,
             modality_configs=modality_configs,
@@ -586,12 +734,10 @@ class DiTCalibrationDataset(Dataset):
             video_backend=video_backend,
         )
 
-        # Use sequential indices for calibration
         self.dataset_size = len(self.lerobot_dataset)
         print(f"DiT Dataset size: {self.dataset_size}")
         self.calib_size = min(calib_size, self.dataset_size)
 
-        # Get dimensions from policy
         self.input_embedding_dim = policy.model.action_head.config.input_embedding_dim
         self.backbone_embedding_dim = policy.model.action_head.config.backbone_embedding_dim
         self.action_horizon = policy.model.action_head.config.action_horizon
@@ -601,12 +747,8 @@ class DiTCalibrationDataset(Dataset):
         return self.calib_size
 
     def __getitem__(self, idx):
-        # Use sequential indices directly
         data = self.lerobot_dataset[idx]
-
-        # Process the data to get DiT inputs
         processed_data = self._process_dit_data(data)
-
         return processed_data
 
     def _process_dit_data(self, data):
@@ -615,39 +757,29 @@ class DiTCalibrationDataset(Dataset):
         Returns the necessary inputs for running the denoising loop.
         """
         try:
-            # Ensure data is in the correct format for apply_transforms
             is_batch = self.policy._check_state_is_batched(data)
             if not is_batch:
                 data = unsqueeze_dict_values(data)
 
-            # Apply the same transforms as used in training/inference
             transformed_data = self.policy.apply_transforms(data)
 
-            # Use the model's prepare_input method which returns backbone_inputs and action_inputs
             backbone_inputs, action_inputs = self.policy.model.prepare_input(transformed_data)
             backbone_outputs = self.policy.model.backbone(backbone_inputs)
 
-            # After ViT/LLM INT8 quantization, backbone outputs may be in float16
-            # while action_head parameters remain in bfloat16. Cast to match.
             action_head_dtype = next(self.policy.model.action_head.parameters()).dtype
             for key in backbone_outputs:
                 if isinstance(backbone_outputs[key], torch.Tensor) and backbone_outputs[key].is_floating_point():
                     backbone_outputs[key] = backbone_outputs[key].to(action_head_dtype)
 
-            backbone_output = self.policy.model.action_head.process_backbone_output(
-                backbone_outputs
-            )
+            backbone_output = self.policy.model.action_head.process_backbone_output(backbone_outputs)
 
-            # Get vision and language embeddings.
             vl_embs = backbone_output["backbone_features"]
             embodiment_id = action_inputs["embodiment_id"]
 
-            # Embed state.
             state_features = self.policy.model.action_head.state_encoder(
                 action_inputs["state"], embodiment_id
             )
 
-            # Set initial actions as the sampled noise.
             batch_size = vl_embs.shape[0]
             device = vl_embs.device
             actions = torch.randn(
@@ -661,10 +793,10 @@ class DiTCalibrationDataset(Dataset):
             )
 
             return {
-                "vl_embs": vl_embs,  # Remove batch dimension
-                "state_features": state_features,  # Remove batch dimension
-                "actions": actions,  # Remove batch dimension
-                "embodiment_id": embodiment_id,  # Remove batch dimension
+                "vl_embs": vl_embs,
+                "state_features": state_features,
+                "actions": actions,
+                "embodiment_id": embodiment_id,
             }
         except Exception as e:
             raise RuntimeError(f"DiT data processing failed: {e}")
@@ -697,10 +829,6 @@ def _quantize_dit_model(model, calib_dataloader, quant_cfg, action_head):
     Custom calibration loop for DiT model that runs the full denoising process.
     DiT requires multiple forward passes (typically 4 steps) for proper calibration.
     """
-    # Convert action_head sub-modules (action_encoder, future_tokens, action_decoder,
-    # position_embedding, state_encoder) to the same dtype as the DiT model (float16).
-    # Without this, these modules remain in bfloat16 (from model config), and mixing
-    # bfloat16 + float16 in torch.cat promotes everything to float32, causing OOM.
     dit_dtype = next(model.parameters()).dtype
     action_head.to(dit_dtype)
 
@@ -785,36 +913,15 @@ def quantize_vit(
     data_config="fourier_gr1_arms_only",
     model_path="nvidia/GR00T-N1.5-3B",
 ):
-    """
-    Quantize the ViT model using FP8 or INT8 quantization.
-
-    Args:
-        model: The ViT model to quantize
-        precision: Quantization precision (fp8, int8, fp16)
-        calib_size: Number of calibration samples
-        batch_size: Batch size for calibration
-        dataset_path: Path to LeRobot dataset
-        modality_configs: Modality configuration
-        embodiment_tag: Embodiment tag
-        video_backend: Video backend
-        policy: Gr00tPolicy instance
-        compare_accuracy: Whether to compare accuracy before/after quantization
-
-    Returns:
-        Quantized model
-    """
     if mtq is None:
         raise ImportError("modelopt is required for quantization")
 
-    assert precision in [
-        "fp8",
-        "fp16",
-        "int8",
-    ], f"Only fp8, int8, and fp16 are supported for ViT. You passed: {precision}."
+    assert precision in ["fp8", "fp16", "int8"], (
+        f"Only fp8, int8, and fp16 are supported for ViT. You passed: {precision}."
+    )
 
     quant_cfg = _get_vit_quant_cfg(precision)
 
-    # Create the dataset and dataloader
     if dataset_path is None or modality_configs is None or policy is None:
         raise ValueError(
             "ViT quantization requires valid dataset_path, modality_configs, and policy."
@@ -840,11 +947,9 @@ def quantize_vit(
 
     data_loader = DataLoader(dataset, batch_size=1, shuffle=True, collate_fn=no_batch_collate_fn)
 
-    # Quantize the model if quantization config is provided
     if quant_cfg is not None:
         quantized_model = _quantize_model(model, data_loader, quant_cfg)
         mtq.print_quant_summary(quantized_model)
-
         return quantized_model
     else:
         print("No quantization applied to ViT model")
@@ -868,39 +973,15 @@ def quantize_dit(
     data_config="fourier_gr1_arms_only",
     model_path="nvidia/GR00T-N1.5-3B",
 ):
-    """
-    Quantize the DiT (Diffusion Transformer) model using FP8 or INT8 quantization.
-
-    Args:
-        model: The DiT model to quantize
-        action_head: The action head containing encoder/decoder and other components
-        precision: Quantization precision (fp8, int8, fp16)
-        calib_size: Number of calibration samples
-        batch_size: Batch size for calibration
-        dataset_path: Path to LeRobot dataset
-        modality_configs: Modality configuration
-        embodiment_tag: Embodiment tag
-        video_backend: Video backend
-        policy: Gr00tPolicy instance
-        compare_accuracy: Whether to compare accuracy before/after quantization
-        attention_mask: Attention mask for sequence length
-        input_state: Input state for dimensions
-
-    Returns:
-        Quantized model
-    """
     if mtq is None:
         raise ImportError("modelopt is required for quantization")
 
-    assert precision in [
-        "fp8",
-        "fp16",
-        "int8",
-    ], f"Only fp8, int8, and fp16 are supported for DiT. You passed: {precision}."
+    assert precision in ["fp8", "fp16", "int8"], (
+        f"Only fp8, int8, and fp16 are supported for DiT. You passed: {precision}."
+    )
 
     quant_cfg = _get_dit_quant_cfg(precision)
 
-    # Create the dataset and dataloader
     if dataset_path is None or modality_configs is None or policy is None:
         raise ValueError(
             "DiT quantization requires valid dataset_path, modality_configs, and policy."
@@ -926,14 +1007,11 @@ def quantize_dit(
 
     data_loader = DataLoader(dataset, batch_size=1, shuffle=True, collate_fn=no_batch_collate_fn)
 
-    # Quantize the model if quantization config is provided
     if quant_cfg is not None:
-        # Use custom DiT calibration function that runs the denoising loop
         quantized_model = _quantize_dit_model(
             model, data_loader, quant_cfg, calibration_policy.model.action_head
         )
         mtq.print_quant_summary(quantized_model)
-
         return quantized_model
     else:
         print("No quantization applied to DiT model")
@@ -943,15 +1021,6 @@ def quantize_dit(
 def compare_model_accuracy(original_model, quantized_model, test_data, device="cuda"):
     """
     Compare accuracy between original and quantized models.
-
-    Args:
-        original_model: The original model before quantization
-        quantized_model: The quantized model after quantization
-        test_data: Test data for comparison
-        device: Device to run comparison on
-
-    Returns:
-        dict: Comparison results including mean difference, max difference, etc.
     """
     print("\n🔍 COMPARING MODEL ACCURACY BEFORE AND AFTER QUANTIZATION...")
 
@@ -963,25 +1032,19 @@ def compare_model_accuracy(original_model, quantized_model, test_data, device="c
 
     with torch.no_grad():
         for i, data in enumerate(test_data):
-            if i >= 5:  # Limit to 5 samples for comparison
+            if i >= 5:
                 break
 
-            # Move data to device
             data = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in data.items()}
 
             try:
-                # Get outputs from both models
                 original_output = original_model(**data)
                 quantized_output = quantized_model(**data)
 
-                # Calculate difference
-                if isinstance(original_output, torch.Tensor) and isinstance(
-                    quantized_output, torch.Tensor
-                ):
+                if isinstance(original_output, torch.Tensor) and isinstance(quantized_output, torch.Tensor):
                     diff = torch.abs(original_output - quantized_output)
                     mean_diff = torch.mean(diff).item()
                     max_diff = torch.max(diff).item()
-                    # Compute cosine similarity
                     orig_flat = original_output.flatten()
                     quant_flat = quantized_output.flatten()
                     cos_sim = torch.nn.functional.cosine_similarity(
@@ -991,9 +1054,7 @@ def compare_model_accuracy(original_model, quantized_model, test_data, device="c
 
                     differences.append(mean_diff)
                     max_diffs.append(max_diff)
-                    # INSERT_YOUR_CODE
                     print(f"Sample {i+1}: Mean diff: {mean_diff:.6f}, Max diff: {max_diff:.6f}")
-                    # Print the position and the original value of the max diff
                     max_diff_pos = (diff == torch.max(diff)).nonzero(as_tuple=True)
                     if len(max_diff_pos[0]) > 0:
                         idx = tuple(pos[0].item() for pos in max_diff_pos)
@@ -1003,7 +1064,6 @@ def compare_model_accuracy(original_model, quantized_model, test_data, device="c
                         )
 
                 elif hasattr(original_output, "logits") and hasattr(quantized_output, "logits"):
-                    # Handle model outputs with logits
                     diff = torch.abs(original_output.logits - quantized_output.logits)
                     mean_diff = torch.mean(diff).item()
                     max_diff = torch.max(diff).item()
@@ -1027,7 +1087,6 @@ def compare_model_accuracy(original_model, quantized_model, test_data, device="c
         print(f"Average max difference: {avg_max_diff:.6f}")
         print(f"Overall max difference: {overall_max_diff:.6f}")
 
-        # Determine if quantization is acceptable
         if avg_mean_diff < 0.01:
             print("✅ Quantization accuracy is excellent (< 0.01)")
         elif avg_mean_diff < 0.1:
@@ -1068,17 +1127,14 @@ def quantize_llm(
     if mtq is None:
         raise ImportError("modelopt is required for quantization")
 
-    assert precision in [
-        "nvfp4",
-        "fp8",
-        "int8",
-    ], f"Only nvfp4 (W4A4), fp8, and int8 are supported. You passed an unsupported precision: {precision}."
+    assert precision in ["nvfp4", "fp8", "int8"], (
+        f"Only nvfp4 (W4A4), fp8, and int8 are supported. You passed an unsupported precision: {precision}."
+    )
 
     quant_cfg = _get_llm_quant_cfg(precision, full_layer_quant, int8_algo)
 
     print(f"Quantization configuration: {quant_cfg}")
 
-    # Create the dataset and dataloader
     if dataset_path is None or modality_configs is None:
         raise ValueError("LLM quantization requires valid dataset_path and modality_configs.")
 
@@ -1102,21 +1158,18 @@ def quantize_llm(
 
     data_loader = DataLoader(dataset, batch_size=1, shuffle=True, collate_fn=no_batch_collate_fn)
 
-    # Store original model for comparison
     original_model = None
     if compare_accuracy:
         print("📋 Creating backup of original model for accuracy comparison...")
         original_model = copy.deepcopy(model)
         original_model.eval()
 
-    # Quantize the model
     quantized_model = _quantize_model(model, data_loader, quant_cfg)
     mtq.print_quant_summary(quantized_model)
-    # Compare accuracy if requested
+
     if compare_accuracy and original_model is not None:
         print("\n🔍 Starting accuracy comparison...")
         try:
-            # Create a test dataset (use first few samples from calibration data)
             test_data = DataLoader(
                 dataset, batch_size=1, shuffle=False, collate_fn=no_batch_collate_fn
             )
@@ -1144,7 +1197,6 @@ def get_input_info(policy, observations):
         observations = unsqueeze_dict_values(observations)
 
     normalized_input = unsqueeze_dict_values
-    # Apply transforms
     normalized_input = policy.apply_transforms(observations)
 
     return normalized_input["eagle_attention_mask"], normalized_input["state"]
@@ -1171,14 +1223,12 @@ def export_eagle2_vit(
         def forward(
             self,
             pixel_values: torch.FloatTensor,
-            position_ids: torch.LongTensor,  # position_ids is now an input
+            position_ids: torch.LongTensor,
             interpolate_pos_encoding=False,
         ) -> torch.Tensor:
             _, _, height, width = pixel_values.shape
             target_dtype = self.patch_embedding.weight.dtype
-            patch_embeds = self.patch_embedding(
-                pixel_values.to(dtype=target_dtype)
-            )  # shape = [*, width, grid, grid]
+            patch_embeds = self.patch_embedding(pixel_values.to(dtype=target_dtype))
             embeddings = patch_embeds.flatten(2).transpose(1, 2)
 
             if interpolate_pos_encoding:
@@ -1196,20 +1246,16 @@ def export_eagle2_vit(
         def forward(
             self,
             pixel_values,
-            position_ids,  # Pass position_ids as input
+            position_ids,
             output_attentions: Optional[bool] = None,
             output_hidden_states: Optional[bool] = None,
             interpolate_pos_encoding: Optional[bool] = False,
         ):
             output_attentions = (
-                output_attentions
-                if output_attentions is not None
-                else self.config.output_attentions
+                output_attentions if output_attentions is not None else self.config.output_attentions
             )
             output_hidden_states = (
-                output_hidden_states
-                if output_hidden_states is not None
-                else self.config.output_hidden_states
+                output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
             )
 
             hidden_states = self.embeddings(
@@ -1233,7 +1279,6 @@ def export_eagle2_vit(
     model.load_state_dict(vision_model.state_dict())
     model.eval().cuda()
 
-    # Quantize ViT if requested
     if vit_dtype in ["fp8", "int8"]:
         print(f"Quantizing Eagle2 ViT to {vit_dtype}")
         model = quantize_vit(
@@ -1250,7 +1295,6 @@ def export_eagle2_vit(
             video_backend=video_backend,
         )
 
-    # Get the number of video views from modality_configs
     num_video_views = 1
     if modality_configs is not None and "video" in modality_configs:
         num_video_views = len(modality_configs["video"].modality_keys)
@@ -1273,12 +1317,14 @@ def export_eagle2_vit(
     )
 
     os.makedirs(output_dir, exist_ok=True)
+    vit_onnx_path = f"{output_dir}/eagle2/vit_{vit_dtype}.onnx"
+
     with torch.inference_mode():
         torch.onnx.export(
             model,
-            (pixel_values, position_ids),  # Include position_ids in ONNX export
-            f"{output_dir}/eagle2/vit_{vit_dtype}.onnx",
-            input_names=["pixel_values", "position_ids"],  # Add position_ids to input names
+            (pixel_values, position_ids),
+            vit_onnx_path,
+            input_names=["pixel_values", "position_ids"],
             output_names=["vit_embeds"],
             opset_version=19,
             do_constant_folding=True,
@@ -1290,9 +1336,12 @@ def export_eagle2_vit(
         )
 
     if vit_dtype == "int8":
-        _rewrite_layernorm_initializers_for_float_inputs(
-            f"{output_dir}/eagle2/vit_{vit_dtype}.onnx"
-        )
+        _rewrite_layernorm_initializers_for_float_inputs(vit_onnx_path)
+
+    if vit_dtype in ["fp8", "int8"]:
+        _print_onnx_file_size(vit_onnx_path, tag=f"Eagle2 ViT {vit_dtype}")
+        _inspect_onnx_qdq(vit_onnx_path, tag=f"Eagle2 ViT {vit_dtype}")
+        _inspect_onnx_initializer_dtypes(vit_onnx_path, tag=f"Eagle2 ViT {vit_dtype}")
 
 
 def export_eagle2_llm(
@@ -1317,14 +1366,12 @@ def export_eagle2_llm(
         def __init__(self, **kwargs):
             super().__init__(**kwargs)
 
-            # Modify LlamamModel architecture for ONNX export
             config = AutoConfig.from_pretrained(DEFAULT_EAGLE_PATH, trust_remote_code=True)
-            config._attn_implementation = "eager"  # not use flash attention
+            config._attn_implementation = "eager"
 
             assert config.text_config.architectures[0] == "Qwen3ForCausalLM"
             self.eagle_model.language_model = Qwen3ForCausalLM(config.text_config)
 
-            # # remove parts of the LLM
             while len(self.eagle_model.language_model.model.layers) > kwargs["select_layer"]:
                 self.eagle_model.language_model.model.layers.pop(-1)
 
@@ -1363,16 +1410,18 @@ def export_eagle2_llm(
             int8_algo=int8_algo,
         )
 
-        # This is required for nvfp4 ONNX export
+        _inspect_torch_quantization(model, tag=f"Eagle2 LLM {llm_dtype}")
+        _configure_llm_modelopt_onnx_quantizers(
+            model,
+            precision=llm_dtype,
+            tag=f"Eagle2 LLM {llm_dtype}",
+        )
+
         if llm_dtype == "nvfp4":
             from modelopt.torch.quantization.utils import is_quantized_linear
 
             for module in model.modules():
                 assert not isinstance(module, torch.nn.Linear) or is_quantized_linear(module)
-                if isinstance(module, torch.nn.Linear):
-                    module.input_quantizer._trt_high_precision_dtype = "Half"
-                    module.input_quantizer._onnx_quantizer_type = "dynamic"
-                    module.weight_quantizer._onnx_quantizer_type = "static"
 
     inputs_embeds = torch.randn(
         (
@@ -1384,7 +1433,6 @@ def export_eagle2_llm(
     ).cuda()
     attention_mask = torch.ones((1, attention_mask.shape[1]), dtype=torch.int64).cuda()
 
-    # Use different filename for full layer quantization
     llm_dtype_suffix = (
         f"{llm_dtype}_full"
         if (llm_dtype in ("nvfp4", "int8") and full_layer_quant)
@@ -1415,6 +1463,14 @@ def export_eagle2_llm(
         f"Eagle2 LLM ONNX Export from torch completed in {end_time - start_time}s. ONNX file is saved to {onnx_path}."
     )
 
+    if llm_dtype in ["nvfp4", "fp8", "int8"]:
+        _print_onnx_file_size(onnx_path, tag=f"Eagle2 LLM {llm_dtype} before postprocess")
+        _inspect_onnx_qdq(onnx_path, tag=f"Eagle2 LLM {llm_dtype} before postprocess")
+        _inspect_onnx_initializer_dtypes(
+            onnx_path,
+            tag=f"Eagle2 LLM {llm_dtype} before postprocess",
+        )
+
     if llm_dtype == "nvfp4":
         print("Converting nvfp4 ONNX model to 2dq")
         import onnx
@@ -1430,6 +1486,13 @@ def export_eagle2_llm(
             all_tensors_to_one_file=True,
             location=f"llm_{llm_dtype}.onnx_data",
             convert_attribute=True,
+        )
+
+        _print_onnx_file_size(onnx_path, tag=f"Eagle2 LLM {llm_dtype} after fp4qdq_to_2dq")
+        _inspect_onnx_qdq(onnx_path, tag=f"Eagle2 LLM {llm_dtype} after fp4qdq_to_2dq")
+        _inspect_onnx_initializer_dtypes(
+            onnx_path,
+            tag=f"Eagle2 LLM {llm_dtype} after fp4qdq_to_2dq",
         )
 
 
@@ -1462,17 +1525,6 @@ def export_action_head(
 ):
     """
     Export the action head models to ONNX format with optional DiT quantization.
-
-    Args:
-        policy: Gr00tPolicy instance
-        ONNX_export_path: Path to save ONNX models
-        input_state: Input state tensor
-        attention_mask: Attention mask tensor
-        dit_dtype: Data type for DiT export (fp16 or fp8 for quantization)
-        calib_dataset_path: Path to LeRobot dataset for calibration
-        modality_configs: Modality configuration
-        embodiment_tag: Embodiment tag
-        calib_size: Number of calibration samples
     """
     process_backbone_model = (
         VLLN_VLSelfAttention(
@@ -1549,14 +1601,11 @@ def export_action_head(
         },
     )
 
-    # DiT model with optional FP8 or INT8 quantization
     dit_model_dtype = torch.float16
     DiT = policy.model.action_head.model.to(dit_model_dtype).cuda()
 
-    # Quantize DiT if requested
     if dit_dtype in ["fp8", "int8"]:
         print(f"Quantizing DiT to {dit_dtype}")
-        # Use a default dataset path if None
         dataset_path_for_calib = (
             calib_dataset_path if calib_dataset_path is not None else "dummy_path"
         )
@@ -1609,6 +1658,11 @@ def export_action_head(
     )
     print(f"DiT ONNX exported to {onnx_path}")
 
+    if dit_dtype in ["fp8", "int8"]:
+        _print_onnx_file_size(onnx_path, tag=f"DiT {dit_dtype}")
+        _inspect_onnx_qdq(onnx_path, tag=f"DiT {dit_dtype}")
+        _inspect_onnx_initializer_dtypes(onnx_path, tag=f"DiT {dit_dtype}")
+
     action_decoder = policy.model.action_head.action_decoder.to(torch.float16)
     model_output_tensor = torch.randn(
         (
@@ -1654,7 +1708,6 @@ def run_groot_inference(
     int8_algo: str = "smoothquant",
 ) -> Dict[str, float]:
 
-    # load the policy
     data_config_obj = load_data_config(data_config)
     modality_config = data_config_obj.modality_config()
     modality_transform = data_config_obj.transform()
@@ -1668,22 +1721,21 @@ def run_groot_inference(
         device=device,
     )
     modality_config = policy.modality_config
-    # load the dataset
+
     dataset = LeRobotSingleDataset(
         dataset_path=dataset_path,
         modality_configs=modality_config,
         embodiment_tag=embodiment_tag,
         video_backend=video_backend,
         video_backend_kwargs=None,
-        transforms=None,  # We'll handle transforms separately through the policy
+        transforms=None,
     )
 
     step_data = dataset[0]
-    # get the action
     predicted_action = policy.get_action(step_data)
 
     attention_mask, state = get_input_info(policy, step_data)
-    # export onnx
+
     os.makedirs(onnx_model_path, exist_ok=True)
     os.makedirs(os.path.join(onnx_model_path, "eagle2"), exist_ok=True)
     os.makedirs(os.path.join(onnx_model_path, "action_head"), exist_ok=True)

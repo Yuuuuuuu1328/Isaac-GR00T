@@ -108,9 +108,8 @@ class Engine(object):
             runtime_shape = self.execution_context.get_tensor_shape(name)
             assert isinstance(x, torch.Tensor), f"Unsupported tensor type: {type(x)}"
             assert runtime_shape == x.shape, f"Invalid input shape: {runtime_shape} != {x.shape}"
-            assert (
-                dtype == x.dtype
-            ), f"Invalid tensor dtype, excepted dtype is {dtype}, but got {x.dtype}"
+            if dtype != x.dtype:
+                x = x.to(dtype)
             assert x.is_cuda, f"Invalid tensor device, excepted device is cuda, but got {x.device}"
             x = x.cuda().contiguous()
             self.execution_context.set_tensor_address(name, x.data_ptr())
@@ -126,9 +125,8 @@ class Engine(object):
             assert (
                 runtime_shape == x.shape
             ), f"Invalid input[{name}] shape: {x.shape}, but the expected shape is: {runtime_shape}"
-            assert (
-                dtype == x.dtype
-            ), f"Invalid tensor[{name}] dtype, expected dtype is {dtype}, but got {x.dtype}"
+            if dtype != x.dtype:
+                x = x.to(dtype)
             assert (
                 x.is_cuda
             ), f"Invalid tensor[{name}] device, expected device is cuda, but got {x.device}"

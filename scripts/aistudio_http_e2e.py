@@ -28,7 +28,7 @@ DEFAULT_OSSFS_WORKSPACE = "/home/jetson/Desktop/project/ossfs/node_59823209/work
 DEFAULT_TRT_ENGINE_PATH = (
     "/home/jetson/Desktop/project/Isaac-GR00T/gr00t_engine_new_interaction_group_fp16"
 )
-DEFAULT_TASK_PROMPT = "Move to center the book in view. Do nothing if no book is present."
+DEFAULT_TASK_PROMPT = "book"
 DEFAULT_DATA_CONFIG = "new_interaction_group"
 DEFAULT_EMBODIMENT_TAG = "new_embodiment"
 DEFAULT_RESPONSE_ACTION_HORIZON = 14
@@ -43,7 +43,7 @@ DEFAULT_SEED = 0
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_OUTPUT_JSONL = (
-    _REPO_ROOT / "/home/jetson/Desktop/project/Isaac-GR00T/scripts/results/aistudio_http_e2e_result.jsonl"
+    _REPO_ROOT / "scripts/results/aistudio_http_e2e_result.jsonl"
 )
 
 
@@ -240,6 +240,10 @@ def send_request(
             pure_inference_ms=_coerce_latency_ms(latency.get("pure_inference_ms", 0.0)),
             server_overhead_ms=_coerce_latency_ms(latency.get("server_overhead_ms", 0.0)),
         ),
+        latency_breakdown={
+            "preprocess_ms": _coerce_latency_ms(latency.get("preprocess_ms", 0.0)),
+            "postprocess_ms": _coerce_latency_ms(latency.get("postprocess_ms", 0.0)),
+        },
         json=lambda: body,
     )
     return response, client_round_trip_ms
@@ -400,34 +404,25 @@ class AistudioRuntime:
     metadata: dict = field(default_factory=dict)
     ready: bool = True
 
-    # def _predict_previous_actions(
-    #     self,
-    #     *,
-    #     model_batch: dict[str, Any],
-    # ) -> np.ndarray:
-    #     return self.policy.get_action(model_batch)["action.single_arm"]
-
-# 修改后（正确代码）
     def _predict_previous_actions(
         self,
         *,
         model_batch: dict[str, Any],
-    ) -> tuple[np.ndarray, float]:  
+    ) -> tuple[np.ndarray, float]:
         def _infer_func():
             return self.policy.get_action(model_batch)
-        
-        # ✅ 修正：一次调用同时获取 推理结果 和 GPU 耗时
+
         action_result, gpu_infer_ms = measure_cuda_time_ms(_infer_func)
         previous_actions = action_result["action.single_arm"]
-        
         return previous_actions, gpu_infer_ms
-
-
 
     def predict_with_timing(self, payload: dict) -> tuple[dict, dict[str, Any]]:
         parsed: dict[str, Any] | None = None
-        pure_inference_ms = 0.0
+        get_action_ms = 0.0
+        preprocess_ms = 0.0
+        postprocess_ms = 0.0
         try:
+            t_pre_start = time.perf_counter_ns()
             parsed = parse_aistudio_query(payload)
             frame_rgb = decode_framebuffer(
                 parsed.get("framebuffer", []),
@@ -439,18 +434,22 @@ class AistudioRuntime:
                 robot_state=robot_state,
                 task_prompt=self.task_prompt,
             )
-            # inference_start_ns = time.perf_counter_ns()
-            # previous_actions = self._predict_previous_actions(model_batch=batch)
-            # pure_inference_ms = round(
-            #     (time.perf_counter_ns() - inference_start_ns) / 1_000_000.0,
-            #     4,
-            # )
-            previous_actions, pure_inference_ms = self._predict_previous_actions(model_batch=batch)
+            preprocess_ms = round(
+                (time.perf_counter_ns() - t_pre_start) / 1_000_000.0, 4
+            )
+
+            previous_actions, get_action_ms = self._predict_previous_actions(model_batch=batch)
+
+            t_post_start = time.perf_counter_ns()
             action_string, is_success = postprocess_actions(
                 previous_actions,
                 robot_state,
                 response_action_horizon=self.response_action_horizon,
             )
+            postprocess_ms = round(
+                (time.perf_counter_ns() - t_post_start) / 1_000_000.0, 4
+            )
+
             result_map = {
                 "action_sequence": action_string,
                 "joint_angles": json.dumps(parsed["joint_angles"]),
@@ -466,7 +465,9 @@ class AistudioRuntime:
                 "request_id": str(parsed.get("request_id", "")),
                 "device_id": str(parsed.get("device_id", "")),
                 "backend": str(self.metadata.get("backend", "")),
-                "pure_inference_ms": pure_inference_ms,
+                "get_action_ms": get_action_ms,
+                "preprocess_ms": preprocess_ms,
+                "postprocess_ms": postprocess_ms,
             }
         except Exception as exc:
             request_id = "" if parsed is None else str(parsed.get("request_id", ""))
@@ -484,7 +485,9 @@ class AistudioRuntime:
                     "request_id": request_id,
                     "device_id": device_id,
                     "backend": str(self.metadata.get("backend", "")),
-                    "pure_inference_ms": pure_inference_ms,
+                    "get_action_ms": get_action_ms,
+                    "preprocess_ms": preprocess_ms,
+                    "postprocess_ms": postprocess_ms,
                 },
             )
 
@@ -509,22 +512,29 @@ def create_app(*, runtime, ws_path: str = DEFAULT_WS_PATH):
                     response_body, timing = runtime.predict_with_timing(payload)
                 except Exception as exc:
                     response_body = build_aistudio_error_response(error_message=str(exc))
-                    timing = {"pure_inference_ms": 0.0}
-                
-                # 计算耗时
+                    timing = {
+                        "get_action_ms": 0.0,
+                        "preprocess_ms": 0.0,
+                        "postprocess_ms": 0.0,
+                    }
+
                 server_total_ms = round((time.perf_counter_ns() - request_start_ns) / 1_000_000.0, 4)
-                pure_inference_ms = _coerce_latency_ms(timing.get("pure_inference_ms", 0.0))
-                if pure_inference_ms <= 0.0 and server_total_ms > 0.0:
-                    pure_inference_ms = server_total_ms
-                server_overhead_ms = max(round(server_total_ms - pure_inference_ms, 4), 0.0)
-                
-                # 返回结果
+                get_action_ms = _coerce_latency_ms(timing.get("get_action_ms", 0.0))
+                preprocess_ms = _coerce_latency_ms(timing.get("preprocess_ms", 0.0))
+                postprocess_ms = _coerce_latency_ms(timing.get("postprocess_ms", 0.0))
+                server_overhead_ms = max(
+                    round(server_total_ms - get_action_ms - preprocess_ms - postprocess_ms, 4),
+                    0.0,
+                )
+
                 await websocket.send_json({
                     "status_code": 200,
                     "result": response_body,
                     "latency": {
                         "server_total_ms": _coerce_latency_ms(server_total_ms),
-                        "pure_inference_ms": _coerce_latency_ms(pure_inference_ms),
+                        "get_action_ms": get_action_ms,
+                        "preprocess_ms": preprocess_ms,
+                        "postprocess_ms": postprocess_ms,
                         "server_overhead_ms": _coerce_latency_ms(server_overhead_ms),
                     },
                 })
@@ -600,6 +610,10 @@ def build_runtime(args: argparse.Namespace) -> AistudioRuntime:
             "trt_engine_path": trt_engine_path,
             "ossfs_workspace": args.ossfs_workspace,
             "response_action_horizon": args.response_action_horizon,
+            "vit_dtype": args.vit_dtype,
+            "llm_dtype": args.llm_dtype,
+            "dit_dtype": args.dit_dtype,
+            "denoising_steps": args.denoising_steps,
         },
         ready=True,
     )
@@ -650,15 +664,37 @@ def _host_for_role(args: argparse.Namespace) -> str:
     return DEFAULT_CLIENT_HOST
 
 
+def _fetch_server_metadata(host: str, port: int) -> dict:
+    """Fetch server metadata via HTTP to record actual server config."""
+    import urllib.request
+    try:
+        url = f"http://{host}:{port}/metadata"
+        with urllib.request.urlopen(url, timeout=5) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except Exception as exc:
+        print(f"Warning: could not fetch server meta {exc}")
+        return {}
+
+
 def run_client_benchmark(args: argparse.Namespace) -> int:
     rng = np.random.default_rng(args.seed)
     host = _host_for_role(args)
     total_latency_sum = 0.0
     infer_latency_sum = 0.0
     network_latency_sum = 0.0
+    preprocess_latency_sum = 0.0
+    postprocess_latency_sum = 0.0
     success_count = 0
     failure_count = 0
     config_snapshot = _json_safe(vars(args))
+    server_metadata = _fetch_server_metadata(host, args.port)
+    if server_metadata:
+        config_snapshot["server"] = server_metadata
+        for key in ("backend", "vit_dtype", "llm_dtype", "dit_dtype",
+                    "model_path", "trt_engine_path", "data_config",
+                    "embodiment_tag", "denoising_steps"):
+            if key in server_metadata:
+                config_snapshot[key] = server_metadata[key]
 
     for warmup_index in range(args.warmup_runs):
         request_id = build_iteration_request_id(args.request_id, "warmup", warmup_index)
@@ -700,6 +736,9 @@ def run_client_benchmark(args: argparse.Namespace) -> int:
                 pure_inference_ms=pure_inference_ms,
                 client_round_trip_ms=total_latency_ms,
             )
+            breakdown = getattr(response, "latency_breakdown", {})
+            preprocess_ms = _coerce_latency_ms(breakdown.get("preprocess_ms", 0.0))
+            postprocess_ms = _coerce_latency_ms(breakdown.get("postprocess_ms", 0.0))
             network_latency_ms = round(max(total_latency_ms - pure_inference_ms, 0.0), 4)
             inference_proportion_pct = (
                 round((pure_inference_ms / total_latency_ms) * 100.0, 2)
@@ -710,6 +749,8 @@ def run_client_benchmark(args: argparse.Namespace) -> int:
             total_latency_sum += total_latency_ms
             infer_latency_sum += pure_inference_ms
             network_latency_sum += network_latency_ms
+            preprocess_latency_sum += preprocess_ms
+            postprocess_latency_sum += postprocess_ms
             if result_code == 0:
                 success_count += 1
             else:
@@ -732,6 +773,8 @@ def run_client_benchmark(args: argparse.Namespace) -> int:
                     "latency": {
                         "total_latency_ms": round(total_latency_ms, 4),
                         "pure_inference_ms": round(pure_inference_ms, 4),
+                        "preprocess_ms": preprocess_ms,
+                        "postprocess_ms": postprocess_ms,
                         "network_latency_ms": round(network_latency_ms, 4),
                         "inference_proportion_pct": inference_proportion_pct,
                     },
@@ -785,15 +828,22 @@ def run_client_benchmark(args: argparse.Namespace) -> int:
     average_total = total_latency_sum / run_count
     average_inference = infer_latency_sum / run_count
     average_network = network_latency_sum / run_count
+    average_preprocess = preprocess_latency_sum / run_count
+    average_postprocess = postprocess_latency_sum / run_count
     average_proportion = (
         (infer_latency_sum / total_latency_sum) * 100.0 if total_latency_sum > 0.0 else 0.0
     )
 
+    average_server_total = average_preprocess + average_inference + average_postprocess
+
     print("\n=== Average Latency ===")
-    print(f"📊 Average total latency: {average_total:.5f} ms")
-    print(f"⚡ Average inference latency: {average_inference:.5f} ms")
-    print(f"🌐 Average network latency: {average_network:.5f} ms")
-    print(f"📈 Average inference proportion: {average_proportion:.2f}%")
+    print(f"  Total (client round-trip):     {average_total:.4f} ms")
+    print(f"  Server total:                  {average_server_total:.4f} ms")
+    print(f"    Preprocess (CPU):            {average_preprocess:.4f} ms")
+    print(f"    get_action (CUDA evt):       {average_inference:.4f} ms")
+    print(f"    Postprocess (CPU):           {average_postprocess:.4f} ms")
+    print(f"  Network:                       {average_network:.4f} ms")
+    print(f"  Inference proportion:          {average_proportion:.2f}%")
 
     _append_jsonl_record(
         args.output_jsonl,
@@ -804,6 +854,8 @@ def run_client_benchmark(args: argparse.Namespace) -> int:
             "summary_metrics": {
                 "average_total_latency_ms": round(average_total, 4),
                 "average_inference_latency_ms": round(average_inference, 4),
+                "average_preprocess_ms": round(average_preprocess, 4),
+                "average_postprocess_ms": round(average_postprocess, 4),
                 "average_network_latency_ms": round(average_network, 4),
                 "average_inference_proportion_pct": round(average_proportion, 2),
             },
