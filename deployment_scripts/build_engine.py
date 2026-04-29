@@ -117,6 +117,7 @@ def main():
     parser.add_argument("--vit-dtype", type=str, default="fp8", choices=["fp16", "fp8", "int8"])
     parser.add_argument("--llm-dtype", type=str, default="nvfp4", choices=["fp16", "nvfp4", "nvfp4_full", "fp8", "int8"])
     parser.add_argument("--dit-dtype", type=str, default="fp8", choices=["fp16", "fp8", "int8"])
+    parser.add_argument("--full-layer-quant", action="store_true", help="Match export_onnx_now.py --full-layer-quant: use llm_{dtype}_full.onnx filename")
     parser.add_argument("--max-batch", type=int, default=8)
     parser.add_argument("--video-views", type=int, default=1, choices=[1, 2])
     parser.add_argument("--only", type=str, default="", help="Comma-separated list of model names to build (e.g. vit_int8,llm_int8). Empty means all.")
@@ -129,6 +130,12 @@ def main():
 
     max_batch = args.max_batch
     llm_max_batch = 1 if args.llm_dtype.startswith("nvfp4") else max_batch
+
+    llm_suffix = (
+        f"{args.llm_dtype}_full"
+        if (args.llm_dtype in ("nvfp4", "int8") and args.full_layer_quant)
+        else args.llm_dtype
+    )
 
     onnx_root = args.onnx_root
     engine_root = args.engine_root
@@ -194,9 +201,9 @@ def main():
             "max": {"pixel_values": [max_batch, 3, 224, 224], "position_ids": [max_batch, 256]},
         },
         {
-            "name": f"llm_{args.llm_dtype}",
-            "onnx": f"{onnx_root}/eagle2/llm_{args.llm_dtype}.onnx",
-            "engine": f"{engine_root}/llm_{args.llm_dtype}.engine",
+            "name": f"llm_{llm_suffix}",
+            "onnx": f"{onnx_root}/eagle2/llm_{llm_suffix}.onnx",
+            "engine": f"{engine_root}/llm_{llm_suffix}.engine",
             "min": {"inputs_embeds": [1, min_len, 2048], "attention_mask": [1, min_len]},
             "opt": {"inputs_embeds": [1, opt_len, 2048], "attention_mask": [1, opt_len]},
             "max": {"inputs_embeds": [llm_max_batch, max_len, 2048], "attention_mask": [llm_max_batch, max_len]},
