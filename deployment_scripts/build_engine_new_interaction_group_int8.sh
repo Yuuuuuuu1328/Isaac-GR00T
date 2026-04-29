@@ -13,6 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+#   FULL_LAYER_QUANT=1 bash deployment_scripts/build_engine_new_interaction_group_int8.sh
+
 #!/bin/bash
 set -euo pipefail
 
@@ -29,6 +31,14 @@ ENGINE_ROOT=${ENGINE_ROOT:-gr00t_engine_int8}
 VIT_DTYPE=${VIT_DTYPE:-int8}
 LLM_DTYPE=${LLM_DTYPE:-int8}
 DIT_DTYPE=${DIT_DTYPE:-int8}
+FULL_LAYER_QUANT=${FULL_LAYER_QUANT:-0}
+
+# Compute LLM filename suffix (matches export_onnx_now.py --full-layer-quant)
+if [ "$FULL_LAYER_QUANT" = "1" ] && [[ "$LLM_DTYPE" =~ ^(nvfp4|int8)$ ]]; then
+    LLM_SUFFIX="${LLM_DTYPE}_full"
+else
+    LLM_SUFFIX="${LLM_DTYPE}"
+fi
 
 # Dynamic length configuration (same defaults as build_engine.sh for single video view)
 VIDEO_VIEWS=${VIDEO_VIEWS:-1}
@@ -46,8 +56,9 @@ fi
 
 echo "Building TensorRT engines with the following configurations:"
 echo "  ViT: ${VIT_DTYPE}"
-echo "  LLM: ${LLM_DTYPE}"
+echo "  LLM: ${LLM_DTYPE} (suffix: ${LLM_SUFFIX})"
 echo "  DiT: ${DIT_DTYPE}"
+echo "  FULL_LAYER_QUANT: ${FULL_LAYER_QUANT}"
 echo "  ONNX_ROOT: ${ONNX_ROOT}"
 echo "  ENGINE_ROOT: ${ENGINE_ROOT}"
 echo "  Video Views: ${VIDEO_VIEWS}"
@@ -80,7 +91,7 @@ required_onnx_files=(
     "${ONNX_ROOT}/action_head/action_encoder.onnx"
     "${ONNX_ROOT}/action_head/action_decoder.onnx"
     "${ONNX_ROOT}/eagle2/vit_${VIT_DTYPE}.onnx"
-    "${ONNX_ROOT}/eagle2/llm_${LLM_DTYPE}.onnx"
+    "${ONNX_ROOT}/eagle2/llm_${LLM_SUFFIX}.onnx"
 )
 
 for onnx_file in "${required_onnx_files[@]}"; do
@@ -158,14 +169,14 @@ trtexec --useCudaGraph --verbose --stronglyTyped --separateProfileRun --noDataTr
     > ${ENGINE_ROOT}/vit_${VIT_DTYPE}.log 2>&1
 
 # VLM-LLM
-echo "------------Building VLM-LLM (${LLM_DTYPE})--------------------"
+echo "------------Building VLM-LLM (${LLM_SUFFIX})--------------------"
 trtexec --useCudaGraph --verbose --stronglyTyped --separateProfileRun --noDataTransfers \
-    --onnx=${ONNX_ROOT}/eagle2/llm_${LLM_DTYPE}.onnx \
-    --saveEngine=${ENGINE_ROOT}/llm_${LLM_DTYPE}.engine \
+    --onnx=${ONNX_ROOT}/eagle2/llm_${LLM_SUFFIX}.onnx \
+    --saveEngine=${ENGINE_ROOT}/llm_${LLM_SUFFIX}.engine \
     --minShapes=inputs_embeds:1x${MIN_LEN}x2048,attention_mask:1x${MIN_LEN} \
     --optShapes=inputs_embeds:1x${OPT_LEN}x2048,attention_mask:1x${OPT_LEN} \
     --maxShapes=inputs_embeds:${MAX_BATCH}x${MAX_LEN}x2048,attention_mask:${MAX_BATCH}x${MAX_LEN} \
-    > ${ENGINE_ROOT}/llm_${LLM_DTYPE}.log 2>&1
+    > ${ENGINE_ROOT}/llm_${LLM_SUFFIX}.log 2>&1
 
 echo ""
 echo "============================================================"
