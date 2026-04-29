@@ -193,7 +193,8 @@ def action_head_tensorrt_forward(self, backbone_output, action_input):
 
 
 def setup_tensorrt_engines(
-    policy, trt_engine_path, vit_dtype="fp8", llm_dtype="nvfp4", dit_dtype="fp8"
+    policy, trt_engine_path, vit_dtype="fp8", llm_dtype="nvfp4", dit_dtype="fp8",
+    full_layer_quant=False,
 ):
     """
     Setup TensorRT engines for GR00T model inference.
@@ -201,9 +202,10 @@ def setup_tensorrt_engines(
     Args:
         policy: GR00T policy model instance
         trt_engine_path: Path to the directory containing TensorRT engine files
-        vit_dtype: ViT model dtype (fp16, fp8)
-        llm_dtype: LLM model dtype (fp16, nvfp4)
-        dit_dtype: DiT model dtype (fp16, fp8)
+        vit_dtype: ViT model dtype (fp16, fp8, int8)
+        llm_dtype: LLM model dtype (fp16, nvfp4, fp8, int8)
+        dit_dtype: DiT model dtype (fp16, fp8, int8)
+        full_layer_quant: If True, use llm_{dtype}_full.engine filename
     """
     policy.model.backbone.num_patches = (
         policy.model.backbone.eagle_model.vision_model.vision_model.embeddings.num_patches
@@ -234,12 +236,18 @@ def setup_tensorrt_engines(
         del policy.model.action_head.action_decoder
     torch.cuda.empty_cache()
 
+    llm_suffix = (
+        f"{llm_dtype}_full"
+        if (llm_dtype in ("nvfp4", "int8") and full_layer_quant)
+        else llm_dtype
+    )
+
     # Setup backbone engines
     policy.model.backbone.vit_engine = trt.Engine(
         os.path.join(trt_engine_path, f"vit_{vit_dtype}.engine")
     )
     policy.model.backbone.llm_engine = trt.Engine(
-        os.path.join(trt_engine_path, f"llm_{llm_dtype}.engine")
+        os.path.join(trt_engine_path, f"llm_{llm_suffix}.engine")
     )
 
     # Setup action head engines

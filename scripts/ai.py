@@ -82,6 +82,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--llm-dtype", type=str, choices=["fp16", "nvfp4", "fp8", "int8"], default="fp16"
     )
     parser.add_argument("--dit-dtype", type=str, choices=["fp16", "fp8", "int8"], default="fp16")
+    parser.add_argument("--full-layer-quant", action="store_true", help="Use full layer quantized LLM engine (llm_{dtype}_full.engine)")
 
     parser.add_argument("--image-path", type=str, default="")
     parser.add_argument("--joint-angles", type=str, default="")
@@ -970,6 +971,7 @@ def build_runtime(args: argparse.Namespace) -> AistudioRuntime:
             vit_dtype=args.vit_dtype,
             llm_dtype=args.llm_dtype,
             dit_dtype=args.dit_dtype,
+            full_layer_quant=args.full_layer_quant,
         )
     return AistudioRuntime(
         policy=policy,
