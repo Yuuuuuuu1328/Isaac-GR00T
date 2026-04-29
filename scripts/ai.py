@@ -17,6 +17,11 @@ from fastapi.websockets import WebSocketDisconnect
 from deployment_scripts.ant import ossfs_gr00t_runtime as _ossfs_runtime_helper
 from deployment_scripts.trt_model_forward import setup_tensorrt_engines
 from deployment_scripts.ant.profile_utils import measure_cuda_time_ms, sync_cuda_if_needed
+from deployment_scripts.ant.timing_hooks import (
+    install_timing_hooks as _install_timing_hooks,
+    collect_detail_timing as _collect_detail_timing,
+    empty_timing as _base_empty_timing,
+)
 try:
     from websocket import create_connection as websocket_create_connection
 except ModuleNotFoundError:  # pragma: no cover - handled by runtime/tests
@@ -26,7 +31,7 @@ except ModuleNotFoundError:  # pragma: no cover - handled by runtime/tests
 DEFAULT_MODEL_PATH = "/home/ningjiang/nj/ckpt/gr00t/left_hand_v2_1223"
 DEFAULT_OSSFS_WORKSPACE = "/home/ningjiang/nj/ossfs/node_59823209/workspace"
 DEFAULT_TRT_ENGINE_PATH = (
-    "/home/ningjiang/nj/Isaac-GR00T/gr00t_engine_int8_new09"
+    "/home/ningjiang/nj/Isaac-GR00T/gr00t_engine_fp16_new"
 )
 DEFAULT_TASK_PROMPT = "book"
 DEFAULT_DATA_CONFIG = "new_interaction_group"
@@ -38,12 +43,12 @@ DEFAULT_PORT = 8001
 DEFAULT_WS_PATH = "/ws/predict"
 DEFAULT_TIMEOUT_MS = 15000
 DEFAULT_WARMUP_RUNS = 10
-DEFAULT_MEASURE_RUNS = 20
+DEFAULT_MEASURE_RUNS = 100
 DEFAULT_SEED = 0
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_OUTPUT_JSONL = (
-    _REPO_ROOT / "scripts/results/aistudio_http_e2e_result.jsonl"
+    _REPO_ROOT / "scripts/results/aistudio_http_e2e_result-now.jsonl"
 )
 
 
@@ -375,362 +380,14 @@ def _coerce_latency_ms(value: Any, *, default: float = 0.0) -> float:
         return round(default, 4)
 
 
-
-def _install_timing_hooks(policy) -> None:
-    import torch
-
-    _orig_forward = policy._get_action_from_normalized_input
-    _orig_transforms = policy.apply_transforms
-
-    policy._detail_timing = {}
-
-    def _timed_forward(normalized_input):
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-        start.record()
-        result = _orig_forward(normalized_input)
-        end.record()
-        policy._timing_fwd_start = start
-        policy._timing_fwd_end = end
-        return result
-
-    def _timed_transforms(obs):
-        t0 = time.perf_counter_ns()
-        result = _orig_transforms(obs)
-        policy._timing_transform_ns = time.perf_counter_ns() - t0
-        return result
-
-    policy._get_action_from_normalized_input = _timed_forward
-    policy.apply_transforms = _timed_transforms
-    policy._timing_fwd_start = None
-    policy._timing_fwd_end = None
-    policy._timing_transform_ns = 0
-
-    _install_transform_timing_hooks(policy)
-    _install_backbone_timing_hooks(policy)
-    _install_action_head_timing_hooks(policy)
-
-
-def _install_transform_timing_hooks(policy) -> None:
-    transforms = getattr(policy, "_modality_transform", None)
-    if transforms is None or not hasattr(transforms, "transforms"):
-        return
-
-    for i, transform in enumerate(transforms.transforms):
-        _orig_apply = transform.apply
-        cls_name = type(transform).__name__
-
-        def _make_timed(orig, name, idx):
-            def _timed(data):
-                t0 = time.perf_counter_ns()
-                result = orig(data)
-                elapsed_ns = time.perf_counter_ns() - t0
-                policy._detail_timing[f"transform_{idx}_{name}_ns"] = elapsed_ns
-                return result
-            return _timed
-
-        object.__setattr__(transform, "apply", _make_timed(_orig_apply, cls_name, i))
-
-
-def _install_backbone_timing_hooks(policy) -> None:
-    import torch
-
-    model = getattr(policy, "model", None)
-    if model is None:
-        return
-    backbone = getattr(model, "backbone", None)
-    if backbone is None:
-        return
-
-    _orig_backbone_forward = backbone.forward
-
-    is_trt = hasattr(backbone, "vit_engine")
-
-    if is_trt:
-        def _timed_backbone_forward(vl_input):
-            detail = policy._detail_timing
-
-            _orig_vit_fwd = backbone.vit_engine.forward
-            _orig_llm_fwd = backbone.llm_engine.forward
-
-            vit_start = torch.cuda.Event(enable_timing=True)
-            vit_end = torch.cuda.Event(enable_timing=True)
-            llm_start = torch.cuda.Event(enable_timing=True)
-            llm_end = torch.cuda.Event(enable_timing=True)
-
-            def _timed_vit(*args, **kwargs):
-                vit_start.record()
-                res = _orig_vit_fwd(*args, **kwargs)
-                vit_end.record()
-                return res
-
-            def _timed_llm(*args, **kwargs):
-                llm_start.record()
-                res = _orig_llm_fwd(*args, **kwargs)
-                llm_end.record()
-                return res
-
-            backbone.vit_engine.forward = _timed_vit
-            backbone.llm_engine.forward = _timed_llm
-            try:
-                result = _orig_backbone_forward(vl_input)
-            finally:
-                backbone.vit_engine.forward = _orig_vit_fwd
-                backbone.llm_engine.forward = _orig_llm_fwd
-
-            detail["_vit_start"] = vit_start
-            detail["_vit_end"] = vit_end
-            detail["_llm_start"] = llm_start
-            detail["_llm_end"] = llm_end
-            return result
-    else:
-        def _timed_backbone_forward(vl_input):
-            detail = policy._detail_timing
-
-            orig_forward_eagle = backbone.forward_eagle
-
-            def _timed_forward_eagle(vl_in):
-                eagle_model = backbone.eagle_model
-                _orig_eagle_call = eagle_model.forward
-
-                vit_start = torch.cuda.Event(enable_timing=True)
-                vit_end = torch.cuda.Event(enable_timing=True)
-                llm_start = torch.cuda.Event(enable_timing=True)
-                llm_end = torch.cuda.Event(enable_timing=True)
-
-                def _timed_eagle_call(**kwargs):
-                    vision_model = eagle_model.vision_model
-                    language_model = eagle_model.language_model
-
-                    _orig_vision_fwd = vision_model.forward
-                    _orig_language_fwd = language_model.forward
-
-                    def _timed_vision(*a, **kw):
-                        vit_start.record()
-                        res = _orig_vision_fwd(*a, **kw)
-                        vit_end.record()
-                        return res
-
-                    def _timed_language(*a, **kw):
-                        llm_start.record()
-                        res = _orig_language_fwd(*a, **kw)
-                        llm_end.record()
-                        return res
-
-                    vision_model.forward = _timed_vision
-                    language_model.forward = _timed_language
-                    try:
-                        res = _orig_eagle_call(**kwargs)
-                    finally:
-                        vision_model.forward = _orig_vision_fwd
-                        language_model.forward = _orig_language_fwd
-                    return res
-
-                eagle_model.forward = _timed_eagle_call
-                try:
-                    result = orig_forward_eagle(vl_in)
-                finally:
-                    eagle_model.forward = _orig_eagle_call
-
-                detail["_vit_start"] = vit_start
-                detail["_vit_end"] = vit_end
-                detail["_llm_start"] = llm_start
-                detail["_llm_end"] = llm_end
-                return result
-
-            backbone.forward_eagle = _timed_forward_eagle
-            try:
-                result = _orig_backbone_forward(vl_input)
-            finally:
-                backbone.forward_eagle = orig_forward_eagle
-            return result
-
-    backbone.forward = _timed_backbone_forward
-
-
-
-def _install_action_head_timing_hooks(policy) -> None:
-    import torch
-
-    model = getattr(policy, "model", None)
-    if model is None:
-        return
-    action_head = getattr(model, "action_head", None)
-    if action_head is None:
-        return
-
-    _orig_get_action = action_head.get_action
-    is_trt = hasattr(action_head, "DiT_engine")
-
-    if is_trt:
-        def _timed_get_action(backbone_output, action_input):
-            detail = policy._detail_timing
-
-            for key in ("features_process", "state_encoder", "action_encoder",
-                        "dit_block", "action_decoder"):
-                detail[f"_{key}_events"] = []
-
-            _orig_vlln = action_head.vlln_vl_self_attention_engine.forward
-            _orig_state = action_head.state_encoder_engine.forward
-            _orig_ae = action_head.action_encoder_engine.forward
-            _orig_dit = action_head.DiT_engine.forward
-            _orig_ad = action_head.action_decoder_engine.forward
-
-            def _wrap(orig, name):
-                def _timed(*args, **kwargs):
-                    s = torch.cuda.Event(enable_timing=True)
-                    e = torch.cuda.Event(enable_timing=True)
-                    s.record()
-                    res = orig(*args, **kwargs)
-                    e.record()
-                    detail[f"_{name}_events"].append((s, e))
-                    return res
-                return _timed
-
-            action_head.vlln_vl_self_attention_engine.forward = _wrap(_orig_vlln, "features_process")
-            action_head.state_encoder_engine.forward = _wrap(_orig_state, "state_encoder")
-            action_head.action_encoder_engine.forward = _wrap(_orig_ae, "action_encoder")
-            action_head.DiT_engine.forward = _wrap(_orig_dit, "dit_block")
-            action_head.action_decoder_engine.forward = _wrap(_orig_ad, "action_decoder")
-
-            try:
-                result = _orig_get_action(backbone_output, action_input)
-            finally:
-                action_head.vlln_vl_self_attention_engine.forward = _orig_vlln
-                action_head.state_encoder_engine.forward = _orig_state
-                action_head.action_encoder_engine.forward = _orig_ae
-                action_head.DiT_engine.forward = _orig_dit
-                action_head.action_decoder_engine.forward = _orig_ad
-
-            return result
-    else:
-        def _timed_get_action(backbone_output, action_input):
-            detail = policy._detail_timing
-
-            for key in ("features_process", "state_encoder", "action_encoder",
-                        "dit_block", "action_decoder"):
-                detail[f"_{key}_events"] = []
-
-            _orig_process = action_head.process_backbone_output
-            _orig_state_enc = action_head.state_encoder.forward
-            _orig_action_enc = action_head.action_encoder.forward
-            _orig_dit_fwd = action_head.model.forward
-            _orig_action_dec = action_head.action_decoder.forward
-
-            def _wrap(orig, name):
-                def _timed(*args, **kwargs):
-                    s = torch.cuda.Event(enable_timing=True)
-                    e = torch.cuda.Event(enable_timing=True)
-                    s.record()
-                    res = orig(*args, **kwargs)
-                    e.record()
-                    detail[f"_{name}_events"].append((s, e))
-                    return res
-                return _timed
-
-            action_head.process_backbone_output = _wrap(_orig_process, "features_process")
-            action_head.state_encoder.forward = _wrap(_orig_state_enc, "state_encoder")
-            action_head.action_encoder.forward = _wrap(_orig_action_enc, "action_encoder")
-            action_head.model.forward = _wrap(_orig_dit_fwd, "dit_block")
-            action_head.action_decoder.forward = _wrap(_orig_action_dec, "action_decoder")
-
-            try:
-                result = _orig_get_action(backbone_output, action_input)
-            finally:
-                action_head.process_backbone_output = _orig_process
-                action_head.state_encoder.forward = _orig_state_enc
-                action_head.action_encoder.forward = _orig_action_enc
-                action_head.model.forward = _orig_dit_fwd
-                action_head.action_decoder.forward = _orig_action_dec
-
-            return result
-
-    action_head.get_action = _timed_get_action
-
-
-def _collect_detail_timing(policy) -> dict[str, float]:
-    import torch
-
-    detail = getattr(policy, "_detail_timing", {})
-    result: dict[str, float] = {}
-
-    torch.cuda.synchronize()
-
-    # Transform sub-timings
-    state_action_ns = 0
-    image_preprocess_ns = 0
-    text_tokenization_ns = 0
-    for key, val in detail.items():
-        if not key.startswith("transform_") or not key.endswith("_ns"):
-            continue
-        name_lower = key.lower()
-        if "stateaction" in name_lower or "stateactiontotensor" in name_lower:
-            state_action_ns += val
-        elif "video" in name_lower or "videotensor" in name_lower or "videotransform" in name_lower:
-            image_preprocess_ns += val
-        elif "concat" in name_lower:
-            pass
-        else:
-            text_tokenization_ns += val
-
-    result["state_action_transform_ms"] = round(state_action_ns / 1_000_000.0, 4)
-    result["image_preprocess_ms"] = round(image_preprocess_ns / 1_000_000.0, 4)
-    result["text_tokenization_ms"] = round(text_tokenization_ns / 1_000_000.0, 4)
-
-    # Backbone sub-timings (Vision Encoder, LLM)
-    if "_vit_start" in detail and "_vit_end" in detail:
-        try:
-            result["vision_encoder_ms"] = round(
-                float(detail["_vit_start"].elapsed_time(detail["_vit_end"])), 4
-            )
-        except RuntimeError:
-            result["vision_encoder_ms"] = 0.0
-    else:
-        result["vision_encoder_ms"] = 0.0
-
-    if "_llm_start" in detail and "_llm_end" in detail:
-        try:
-            result["llm_ms"] = round(
-                float(detail["_llm_start"].elapsed_time(detail["_llm_end"])), 4
-            )
-        except RuntimeError:
-            result["llm_ms"] = 0.0
-    else:
-        result["llm_ms"] = 0.0
-
-    # Action head sub-timings
-    for comp_name in ("features_process", "state_encoder", "action_encoder",
-                      "dit_block", "action_decoder"):
-        events = detail.get(f"_{comp_name}_events", [])
-        total_ms = 0.0
-        for s, e in events:
-            try:
-                total_ms += float(s.elapsed_time(e))
-            except RuntimeError:
-                pass
-        result[f"{comp_name}_ms"] = round(total_ms, 4)
-
-    return result
-
-
 def _empty_timing() -> dict[str, float]:
-    return {
-        "preprocess_ms": 0.0,
-        "get_action_ms": 0.0,
-        "model_forward_ms": 0.0,
-        "transform_ms": 0.0,
-        "postprocess_ms": 0.0,
-        "state_action_transform_ms": 0.0,
-        "image_preprocess_ms": 0.0,
-        "text_tokenization_ms": 0.0,
-        "vision_encoder_ms": 0.0,
-        "llm_ms": 0.0,
-        "features_process_ms": 0.0,
-        "state_encoder_ms": 0.0,
-        "action_encoder_ms": 0.0,
-        "dit_block_ms": 0.0,
-        "action_decoder_ms": 0.0,
-    }
+    t = _base_empty_timing()
+    t["preprocess_ms"] = 0.0
+    return t
+
+
+# _install_timing_hooks, _collect_detail_timing are imported from
+# deployment_scripts.ant.timing_hooks (see top-level imports).
 
 
 @dataclass

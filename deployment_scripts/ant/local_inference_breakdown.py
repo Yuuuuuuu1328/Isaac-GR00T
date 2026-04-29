@@ -508,7 +508,8 @@ def _run_single_breakdown(policy, raw_obs: dict[str, Any], compute_dtype, unsque
     def _prepare_model_input():
         return policy.model.prepare_input(normalized_input)
 
-    (backbone_inputs, action_inputs), _ = measure_cuda_time_ms(_prepare_model_input)
+    (backbone_inputs, action_inputs), prepare_input_ms = measure_cuda_time_ms(_prepare_model_input)
+    metrics["prepare_input_ms"] = prepare_input_ms
 
     autocast_context = (
         torch.autocast(device_type="cuda", dtype=compute_dtype)
@@ -532,6 +533,7 @@ def _run_single_breakdown(policy, raw_obs: dict[str, Any], compute_dtype, unsque
     metrics["postprocess_ms"] = postprocess_ms
     metrics["e2e_total_ms"] = round(
         metrics["transform_total_ms"]
+        + metrics["prepare_input_ms"]
         + metrics["backbone_total_ms"]
         + metrics["action_head_total_ms"]
         + metrics["postprocess_ms"],

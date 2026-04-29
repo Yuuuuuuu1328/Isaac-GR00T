@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import re
 import shutil
 import subprocess
@@ -13,6 +14,13 @@ def _mean(values: list[float]) -> float:
 
 def _max(values: list[float]) -> float:
     return round(max(values), 4) if values else 0.0
+
+
+_MB = 1024.0 * 1024.0
+
+# ---------------------------------------------------------------------------
+# Torch CUDA memory
+# ---------------------------------------------------------------------------
 
 
 def reset_torch_peak_memory_stats() -> None:
@@ -42,12 +50,125 @@ def collect_torch_peak_memory_metrics() -> dict[str, float]:
 
     return {
         "torch_peak_memory_allocated_mb": round(
-            torch.cuda.max_memory_allocated() / (1024.0 * 1024.0), 4
+            torch.cuda.max_memory_allocated() / _MB, 4
         ),
         "torch_peak_memory_reserved_mb": round(
-            torch.cuda.max_memory_reserved() / (1024.0 * 1024.0), 4
+            torch.cuda.max_memory_reserved() / _MB, 4
         ),
     }
+
+
+def collect_gpu_memory_metrics() -> dict[str, float]:
+    try:
+        import torch
+    except ModuleNotFoundError:
+        return {}
+    if not torch.cuda.is_available():
+        return {}
+    return {
+        "gpu_mem_allocated_mb": round(torch.cuda.memory_allocated() / _MB, 4),
+        "gpu_mem_reserved_mb": round(torch.cuda.memory_reserved() / _MB, 4),
+        "gpu_mem_peak_allocated_mb": round(torch.cuda.max_memory_allocated() / _MB, 4),
+        "gpu_mem_peak_reserved_mb": round(torch.cuda.max_memory_reserved() / _MB, 4),
+    }
+
+
+# ---------------------------------------------------------------------------
+# CPU (host) memory
+# ---------------------------------------------------------------------------
+
+
+def collect_cpu_memory_metrics() -> dict[str, float]:
+    try:
+        import psutil
+    except ModuleNotFoundError:
+        return {}
+    process = psutil.Process(os.getpid())
+    info = process.memory_info()
+    return {"cpu_rss_mb": round(info.rss / _MB, 4)}
+
+
+# ---------------------------------------------------------------------------
+# pynvml-based GPU device stats (desktop / data-center GPUs)
+# ---------------------------------------------------------------------------
+
+_pynvml_initialized = False
+
+
+def _ensure_pynvml() -> bool:
+    global _pynvml_initialized
+    if _pynvml_initialized:
+        return True
+    try:
+        import pynvml
+
+        pynvml.nvmlInit()
+        _pynvml_initialized = True
+        return True
+    except Exception:
+        return False
+
+
+def collect_gpu_device_metrics(device_index: int = 0) -> dict[str, float]:
+    try:
+        import pynvml
+    except ModuleNotFoundError:
+        return {}
+    if not _ensure_pynvml():
+        return {}
+    try:
+        handle = pynvml.nvmlDeviceGetHandleByIndex(device_index)
+    except Exception:
+        return {}
+
+    result: dict[str, float] = {}
+    try:
+        result["gpu_power_w"] = round(pynvml.nvmlDeviceGetPowerUsage(handle) / 1000.0, 4)
+    except pynvml.NVMLError:
+        pass
+    try:
+        result["gpu_temp_c"] = float(
+            pynvml.nvmlDeviceGetTemperature(handle, pynvml.NVML_TEMPERATURE_GPU)
+        )
+    except pynvml.NVMLError:
+        pass
+    try:
+        util = pynvml.nvmlDeviceGetUtilizationRates(handle)
+        result["gpu_util_pct"] = float(util.gpu)
+        result["gpu_mem_util_pct"] = float(util.memory)
+    except pynvml.NVMLError:
+        pass
+    try:
+        mem_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
+        result["gpu_mem_total_mb"] = round(mem_info.total / _MB, 4)
+        result["gpu_mem_used_mb"] = round(mem_info.used / _MB, 4)
+        result["gpu_mem_free_mb"] = round(mem_info.free / _MB, 4)
+    except pynvml.NVMLError:
+        pass
+    try:
+        clock_sm = pynvml.nvmlDeviceGetClockInfo(handle, pynvml.NVML_CLOCK_SM)
+        result["gpu_clock_sm_mhz"] = float(clock_sm)
+    except pynvml.NVMLError:
+        pass
+    try:
+        clock_mem = pynvml.nvmlDeviceGetClockInfo(handle, pynvml.NVML_CLOCK_MEM)
+        result["gpu_clock_mem_mhz"] = float(clock_mem)
+    except pynvml.NVMLError:
+        pass
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Aggregator
+# ---------------------------------------------------------------------------
+
+
+def collect_all_system_metrics(device_index: int = 0) -> dict[str, float]:
+    metrics: dict[str, float] = {}
+    metrics.update(collect_gpu_memory_metrics())
+    metrics.update(collect_cpu_memory_metrics())
+    metrics.update(collect_gpu_device_metrics(device_index))
+    return metrics
 
 
 def parse_tegrastats_lines(lines: Iterable[str]) -> dict[str, float]:

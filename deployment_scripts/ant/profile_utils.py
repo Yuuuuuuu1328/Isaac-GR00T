@@ -92,8 +92,14 @@ def format_summary(summary: dict[str, Any]) -> str:
             unit = " MB"
         elif "_mw" in metric_name:
             unit = " mW"
+        elif "_w" in metric_name:
+            unit = " W"
         elif "_pct" in metric_name:
             unit = "%"
+        elif "_fps" in metric_name:
+            unit = " FPS"
+        elif "_mhz" in metric_name:
+            unit = " MHz"
         elif "_c" in metric_name:
             unit = " C"
         lines.append(

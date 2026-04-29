@@ -26,6 +26,16 @@ from deployment_scripts.ant.profile_utils import (  # noqa: E402
     write_jsonl,
 )
 from deployment_scripts.ant import ossfs_gr00t_runtime as _ossfs_runtime_helper  # noqa: E402
+from deployment_scripts.ant.metric_aliases import add_canonical_aliases, format_latency_tree  # noqa: E402
+from deployment_scripts.ant.system_metrics import (  # noqa: E402
+    collect_all_system_metrics,
+    collect_gpu_memory_metrics,
+    reset_torch_peak_memory_stats,
+)
+from deployment_scripts.ant.timing_hooks import (  # noqa: E402
+    collect_detail_timing,
+    install_timing_hooks,
+)
 from deployment_scripts.ant.torch_compile_utils import (  # noqa: E402
     add_torch_compile_arg,
     enable_torch_compile_for_breakdown,
@@ -62,6 +72,11 @@ def _resolve_repo_path(path_str: str) -> str:
 
 def _add_common_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     parser.add_argument(
+        "--ossfs-workspace",
+        type=str,
+        default=str(_OSSFS_WORKSPACE),
+    )
+    parser.add_argument(
         "--model-path",
         type=str,
         default="/home/jetson/Desktop/project/new_model/left_hand_v2_1223",
@@ -91,6 +106,7 @@ def _add_tensorrt_args(parser: argparse.ArgumentParser) -> argparse.ArgumentPars
     parser.add_argument("--vit-dtype", type=str, choices=_TRT_VIT_DTYPE_CHOICES, default="fp16")
     parser.add_argument("--llm-dtype", type=str, choices=_TRT_LLM_DTYPE_CHOICES, default="fp16")
     parser.add_argument("--dit-dtype", type=str, choices=_TRT_VIT_DTYPE_CHOICES, default="fp16")
+    parser.add_argument("--full-layer-quant", action="store_true", help="Use full layer quantized LLM engine (llm_{dtype}_full.engine)")
     return parser
 
 
@@ -109,6 +125,7 @@ def build_parser() -> argparse.ArgumentParser:
 def _build_runtime(args: argparse.Namespace, *, use_tensorrt: bool):
     import torch
 
+    _ossfs_runtime_helper._OSSFS_WORKSPACE = Path(args.ossfs_workspace)
     ossfs_runtime = _import_local_gr00t_runtime()
 
     data_config = _resolve_data_config(ossfs_runtime.DATA_CONFIG_MAP, args.data_config)
@@ -141,6 +158,7 @@ def _build_runtime(args: argparse.Namespace, *, use_tensorrt: bool):
             vit_dtype=args.vit_dtype,
             llm_dtype=args.llm_dtype,
             dit_dtype=args.dit_dtype,
+            full_layer_quant=args.full_layer_quant,
         )
 
     dataset = ossfs_runtime.LeRobotSingleDataset(
@@ -151,12 +169,16 @@ def _build_runtime(args: argparse.Namespace, *, use_tensorrt: bool):
         transforms=None,
         embodiment_tag=args.embodiment_tag,
     )
+
+    model_footprint = collect_gpu_memory_metrics()
+
     return (
         policy,
         dataset,
         ossfs_runtime.COMPUTE_DTYPE,
         ossfs_runtime.unsqueeze_dict_values,
         trt_engine_path,
+        model_footprint,
     )
 
 
@@ -203,6 +225,36 @@ def _base_meta(args: argparse.Namespace, script_name: str, run_index: int) -> di
     }
 
 
+def _collect_e2e_timing(policy, get_action_ms: float) -> dict[str, float]:
+    import torch
+
+    model_forward_ms = 0.0
+    if (
+        getattr(policy, "_timing_fwd_start", None) is not None
+        and getattr(policy, "_timing_fwd_end", None) is not None
+    ):
+        torch.cuda.synchronize()
+        model_forward_ms = round(
+            float(policy._timing_fwd_start.elapsed_time(policy._timing_fwd_end)), 4
+        )
+    transform_ms = round(
+        getattr(policy, "_timing_transform_ns", 0) / 1_000_000.0, 4
+    )
+
+    detail = collect_detail_timing(policy)
+    other_ms = round(max(get_action_ms - model_forward_ms - transform_ms, 0.0), 4)
+
+    metrics: dict[str, float] = {
+        "e2e_total_ms": get_action_ms,
+        "get_action_ms": get_action_ms,
+        "model_forward_ms": model_forward_ms,
+        "transform_ms": transform_ms,
+        "other_ms": other_ms,
+    }
+    metrics.update(detail)
+    return metrics
+
+
 def _run_profile_loop(
     *,
     args: argparse.Namespace,
@@ -225,6 +277,15 @@ def _run_profile_loop(
 
     summary = summarize_latency_records(records)
     print(format_summary(summary))
+
+    if records:
+        avg_metrics = {}
+        for key in records[0].metrics:
+            values = [r.metrics.get(key, 0.0) for r in records]
+            avg_metrics[key] = round(sum(values) / len(values), 4)
+        print("\n=== Latency Tree ===")
+        print(format_latency_tree(avg_metrics))
+
     _append_experiment_result_jsonl(
         _DEFAULT_EXPERIMENT_RESULT_JSONL,
         _build_experiment_result(args, script_name, summary, records),
@@ -235,20 +296,29 @@ def _run_profile_loop(
 
 
 def _run_pytorch_e2e(args: argparse.Namespace, script_name: str) -> int:
-    policy, dataset, _, _, _ = _build_runtime(args, use_tensorrt=False)
+    policy, dataset, _, _, _, model_footprint = _build_runtime(args, use_tensorrt=False)
     enable_torch_compile_for_e2e(policy, enabled=args.use_torch_compile)
+    install_timing_hooks(policy)
 
     def _warmup(step_data: dict) -> None:
         _, _ = measure_cuda_time_ms(lambda: policy.get_action(step_data))
 
     def _measure(step_data: dict) -> dict[str, float]:
-        _, e2e_total_ms = measure_cuda_time_ms(lambda: policy.get_action(step_data))
-        return {"e2e_total_ms": e2e_total_ms}
+        reset_torch_peak_memory_stats()
+        if hasattr(policy, "_detail_timing"):
+            policy._detail_timing.clear()
+        _, get_action_ms = measure_cuda_time_ms(lambda: policy.get_action(step_data))
+        metrics = _collect_e2e_timing(policy, get_action_ms)
+        if get_action_ms > 0:
+            metrics["throughput_fps"] = round(1000.0 / get_action_ms, 4)
+        metrics.update(collect_all_system_metrics())
+        return metrics
 
     def _meta(run_index: int) -> dict[str, object]:
         return {
             **_base_meta(args, script_name, run_index),
             "use_torch_compile": args.use_torch_compile,
+            "model_footprint": model_footprint,
         }
 
     return _run_profile_loop(
@@ -265,7 +335,7 @@ def _run_pytorch_e2e(args: argparse.Namespace, script_name: str) -> int:
 def _run_pytorch_breakdown(args: argparse.Namespace, script_name: str) -> int:
     from deployment_scripts.ant.local_inference_breakdown import _run_single_breakdown
 
-    policy, dataset, compute_dtype, unsqueeze_dict_values, _ = _build_runtime(
+    policy, dataset, compute_dtype, unsqueeze_dict_values, _, model_footprint = _build_runtime(
         args, use_tensorrt=False
     )
     enable_torch_compile_for_breakdown(policy, enabled=args.use_torch_compile)
@@ -274,12 +344,19 @@ def _run_pytorch_breakdown(args: argparse.Namespace, script_name: str) -> int:
         _ = _run_single_breakdown(policy, step_data, compute_dtype, unsqueeze_dict_values)
 
     def _measure(step_data: dict) -> dict[str, float]:
-        return dict(_run_single_breakdown(policy, step_data, compute_dtype, unsqueeze_dict_values))
+        reset_torch_peak_memory_stats()
+        metrics = dict(_run_single_breakdown(policy, step_data, compute_dtype, unsqueeze_dict_values))
+        metrics = add_canonical_aliases(metrics)
+        if metrics.get("e2e_total_ms", 0) > 0:
+            metrics["throughput_fps"] = round(1000.0 / metrics["e2e_total_ms"], 4)
+        metrics.update(collect_all_system_metrics())
+        return metrics
 
     def _meta(run_index: int) -> dict[str, object]:
         return {
             **_base_meta(args, script_name, run_index),
             "use_torch_compile": args.use_torch_compile,
+            "model_footprint": model_footprint,
         }
 
     return _run_profile_loop(
@@ -294,14 +371,24 @@ def _run_pytorch_breakdown(args: argparse.Namespace, script_name: str) -> int:
 
 
 def _run_tensorrt_e2e(args: argparse.Namespace, script_name: str) -> int:
-    policy, dataset, _, _, trt_engine_path = _build_runtime(args, use_tensorrt=True)
+    policy, dataset, _, _, trt_engine_path, model_footprint = _build_runtime(
+        args, use_tensorrt=True
+    )
+    install_timing_hooks(policy)
 
     def _warmup(step_data: dict) -> None:
         _, _ = measure_cuda_time_ms(lambda: policy.get_action(step_data))
 
     def _measure(step_data: dict) -> dict[str, float]:
-        _, e2e_total_ms = measure_cuda_time_ms(lambda: policy.get_action(step_data))
-        return {"e2e_total_ms": e2e_total_ms}
+        reset_torch_peak_memory_stats()
+        if hasattr(policy, "_detail_timing"):
+            policy._detail_timing.clear()
+        _, get_action_ms = measure_cuda_time_ms(lambda: policy.get_action(step_data))
+        metrics = _collect_e2e_timing(policy, get_action_ms)
+        if get_action_ms > 0:
+            metrics["throughput_fps"] = round(1000.0 / get_action_ms, 4)
+        metrics.update(collect_all_system_metrics())
+        return metrics
 
     def _meta(run_index: int) -> dict[str, object]:
         return {
@@ -310,6 +397,7 @@ def _run_tensorrt_e2e(args: argparse.Namespace, script_name: str) -> int:
             "vit_dtype": args.vit_dtype,
             "llm_dtype": args.llm_dtype,
             "dit_dtype": args.dit_dtype,
+            "model_footprint": model_footprint,
         }
 
     return _run_profile_loop(
@@ -326,8 +414,8 @@ def _run_tensorrt_e2e(args: argparse.Namespace, script_name: str) -> int:
 def _run_tensorrt_breakdown(args: argparse.Namespace, script_name: str) -> int:
     from deployment_scripts.ant.local_inference_tensorrt_breakdown import _run_single_breakdown
 
-    policy, dataset, compute_dtype, unsqueeze_dict_values, trt_engine_path = _build_runtime(
-        args, use_tensorrt=True
+    policy, dataset, compute_dtype, unsqueeze_dict_values, trt_engine_path, model_footprint = (
+        _build_runtime(args, use_tensorrt=True)
     )
 
     def _warmup(step_data: dict) -> None:
@@ -339,7 +427,8 @@ def _run_tensorrt_breakdown(args: argparse.Namespace, script_name: str) -> int:
         )
 
     def _measure(step_data: dict) -> dict[str, float]:
-        return dict(
+        reset_torch_peak_memory_stats()
+        metrics = dict(
             _run_single_breakdown(
                 policy,
                 step_data,
@@ -347,6 +436,11 @@ def _run_tensorrt_breakdown(args: argparse.Namespace, script_name: str) -> int:
                 compute_dtype=compute_dtype,
             )
         )
+        metrics = add_canonical_aliases(metrics)
+        if metrics.get("e2e_total_ms", 0) > 0:
+            metrics["throughput_fps"] = round(1000.0 / metrics["e2e_total_ms"], 4)
+        metrics.update(collect_all_system_metrics())
+        return metrics
 
     def _meta(run_index: int) -> dict[str, object]:
         return {
@@ -355,6 +449,7 @@ def _run_tensorrt_breakdown(args: argparse.Namespace, script_name: str) -> int:
             "vit_dtype": args.vit_dtype,
             "llm_dtype": args.llm_dtype,
             "dit_dtype": args.dit_dtype,
+            "model_footprint": model_footprint,
         }
 
     return _run_profile_loop(
