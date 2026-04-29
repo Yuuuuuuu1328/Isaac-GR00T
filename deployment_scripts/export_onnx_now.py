@@ -203,9 +203,9 @@ def _configure_llm_modelopt_onnx_quantizers(model, precision: str, tag: str = "L
         not preserve Q/DQ into ONNX/TensorRT.
 
     Export convention:
-      - activation/input quantizer: dynamic
+      - activation/input quantizer: static (enables TRT INT8 kernel fusion)
       - weight quantizer: static
-      - INT8 input Q/DQ high precision dtype: Float, safest for mixed FP16/FP32 graphs
+      - INT8 input Q/DQ high precision dtype: Half (matches FP16 inference graph)
       - NVFP4 keeps Half, matching the original NVIDIA export path
       - FP8 does not force _trt_high_precision_dtype
     """
@@ -235,12 +235,10 @@ def _configure_llm_modelopt_onnx_quantizers(model, precision: str, tag: str = "L
         n_qlinear += 1
 
         if hasattr(module, "input_quantizer"):
-            module.input_quantizer._onnx_quantizer_type = "dynamic"
+            module.input_quantizer._onnx_quantizer_type = "static"
 
             if precision == "int8":
-                # LLM export can contain Float-side Q/DQ. ModelOpt requires either
-                # the dtype to match the ONNX input type or the Q/DQ to be Float.
-                module.input_quantizer._trt_high_precision_dtype = "Float"
+                module.input_quantizer._trt_high_precision_dtype = "Half"
             elif precision == "nvfp4":
                 # Preserve original NVIDIA NVFP4 behavior.
                 module.input_quantizer._trt_high_precision_dtype = "Half"
